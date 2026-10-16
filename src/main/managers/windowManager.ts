@@ -1,0 +1,1974 @@
+import { is, platform } from '@electron-toolkit/utils'
+import {
+  app,
+  BrowserWindow,
+  globalShortcut,
+  Menu,
+  nativeImage,
+  // nativeTheme,
+  screen,
+  Tray
+} from 'electron'
+import { getPreloadPath, getRendererPath } from '../utils/appBundlePath'
+// import trayIconLight from '../../../resources/icons/trayTemplate@2x-light.png?asset'
+import trayIcon from '../../../resources/icons/trayTemplate@2x.png?asset'
+import windowsIcon from '../../../resources/icons/windows-icon.png?asset'
+
+import api from '../api'
+import databaseAPI from '../api/shared/database'
+import dndManager, { isFullscreenWindow } from '../core/dndManager.js'
+import doubleTapManager from '../core/doubleTapManager.js'
+import globalInputManager from '../core/globalInputManager.js'
+import { WindowManager as NativeWindowManager } from '../core/native/index.js'
+import clipboardManager from './clipboardManager'
+
+import { WINDOW_DEFAULT_HEIGHT, WINDOW_WIDTH } from '../common/constants'
+import detachedWindowManager from '../core/detachedWindowManager'
+import superPanelManager from '../core/superPanelManager'
+import { applyWindowMaterial, getDefaultWindowMaterial } from '../utils/windowUtils'
+import pluginManager from './pluginManager'
+import {
+  normalizeCompactMainWindowHeader,
+  resolveMainWindowHeaderHeight
+} from '../../shared/mainWindowLayout'
+
+// 窗口材质类型
+type WindowMaterial = 'mica' | 'acrylic' | 'none'
+const WINDOW_BLUR_DRAG_INPUT_CONSUMER = 'window-blur-drag'
+const DEFAULT_MODAL_DIALOG_BLUR_HIDE_RELEASE_DELAY_MS = 500
+
+/**
+ * 应用快捷键触发时携带的文件输入
+ */
+interface AppShortcutInputFile {
+  path: string
+  name: string
+  isDirectory: boolean
+  isFile?: boolean
+}
+
+/**
+ * 应用快捷键触发时携带的当前输入上下文
+ */
+interface AppShortcutLaunchContext {
+  searchQuery: string
+  pastedImage: string | null
+  pastedFiles: AppShortcutInputFile[] | null
+  pastedText: string | null
+}
+
+/**
+ * 窗口管理器
+ * 负责主窗口的创建、显示/隐藏、快捷键注册等
+ */
+class WindowManager {
+  private mainWindow: BrowserWindow | null = null
+  private tray: Tray | null = null
+  private trayMenu: Menu | null = null // 托盘菜单
+  private currentShortcut = 'Option+Z' // 当前注册的快捷键
+  private isDoubleTapMode = false // 当前呼出快捷键是否为双击修饰键模式
+  private static readonly MODIFIER_NAMES = ['Command', 'Ctrl', 'Alt', 'Option', 'Shift']
+  private isQuitting = false // 是否正在退出应用
+  private previousActiveWindow: {
+    app?: string
+    platform?: 'win32' | 'darwin'
+    kind?: 'windows-explorer' | 'windows-file-dialog' | 'mac-finder' | 'mac-file-dialog'
+    preciseTarget?: boolean
+    bundleId?: string
+    pid?: number
+    title?: string
+    x?: number
+    y?: number
+    width?: number
+    height?: number
+    appPath?: string
+    className?: string
+    hwnd?: number
+    windowId?: number
+    finderId?: number
+    path?: string
+    url?: string
+    axRole?: string
+    axSubrole?: string
+  } | null = null // 打开应用前激活的窗口
+  // private _shouldRestoreFocus = true // TODO: 是否在隐藏窗口时恢复焦点（待实现）
+  private windowPositionsByDisplay: Record<number, { x: number; y: number }> = {}
+  private autoBackToSearchTimer: NodeJS.Timeout | null = null // 自动返回搜索定时器
+  private autoBackToSearchConfig: string = 'never' // 自动返回搜索配置
+  private windowPositionStrategy: string = 'remember' // 窗口呼出位置策略
+  private lastFocusTarget: 'mainWindow' | 'plugin' | null = null // 窗口隐藏前的焦点状态
+  private isRestoringFocus: boolean = false // 是否正在恢复焦点状态（防止 focus 事件监听器干扰）
+  private suppressBlurHide: boolean = false // 临时抑制 blur 事件隐藏窗口（文件关联打开等场景）
+  // 原生模态对话框关闭前后可能发出排队的 blur/mouseup 事件。
+  private modalDialogBlurHideSuppressed: boolean = false
+  private modalDialogBlurHideReleaseTimer: ReturnType<typeof setTimeout> | null = null
+  private modalDialogBlurHideSuppressionDepth: number = 0
+  private lastBlurHideTime: number = 0 // blur 导致隐藏窗口的时间戳（用于解决托盘点击竞态）
+  private blurHideTimer: ReturnType<typeof setTimeout> | null = null // Linux blur 延迟隐藏定时器
+  // macOS 全屏场景的空间锚点；全屏呼出期间复用，普通桌面呼出时释放。
+  private macSpaceAnchor: BrowserWindow | null = null
+  private isPreparingMacSpace = false // 透明迁移阶段不恢复输入焦点，正式显示时再恢复
+  // Double-tap 唤醒窗口时，Windows 可能紧跟一个短暂 blur；这两个 timer 用于跳过误关闭并补一次焦点。
+  private doubleTapFocusTimer: ReturnType<typeof setTimeout> | null = null
+  private windowsHotkeyFocusTimer: ReturnType<typeof setTimeout> | null = null
+  private transientBlurSuppressTimer: ReturnType<typeof setTimeout> | null = null
+  private transientBlurSuppressUntil: number = 0 // 瞬时 blur 抑制截止时间戳，取最长值避免提前释放
+  // 全局左键状态用于区分“点击外部关闭”和“从外部拖文件进窗口”。拖拽时 blur 先挂起，等 mouseup 再判断。
+  private leftMouseDown: boolean = false // 全局左键是否按下，用于拖拽时延迟 blur 隐藏
+  private pendingBlurHideOnMouseUp: boolean = false // blur 时左键按下，等待 mouseup 再决定是否隐藏
+  private pendingBlurHideTimer: ReturnType<typeof setTimeout> | null = null // mouseup 兜底定时器
+  private mouseStateTrackingStarted: boolean = false
+  private appShortcuts: Map<string, string> = new Map() // 应用快捷键映射表 (快捷键 -> 目标指令)
+  private wakeupBlacklist: Array<{ app: string; bundleId?: string; label?: string }> = [] // 唤醒黑名单
+  private onThemeInfoChanged: (() => void) | null = null // 主题信息变更回调钩子
+  private compactMainWindowHeader = false // 主窗口是否使用紧凑顶部栏
+  // 应用快捷键触发时携带的当前输入上下文
+  private appShortcutLaunchContext: AppShortcutLaunchContext = {
+    searchQuery: '',
+    pastedImage: null,
+    pastedFiles: null,
+    pastedText: null
+  }
+
+  /**
+   * 更新焦点目标（供外部调用,如 pluginManager）
+   */
+  public updateFocusTarget(target: 'mainWindow' | 'plugin'): void {
+    this.lastFocusTarget = target
+    console.log('[Window] 焦点目标已更新:', target)
+  }
+
+  /**
+   * 通知渲染进程返回搜索页面
+   */
+  public notifyBackToSearch(): void {
+    this.mainWindow?.webContents.send('back-to-search')
+  }
+
+  /**
+   * 更新主窗口顶部栏密度，后续窗口尺寸和插件视图布局统一读取该状态。
+   * @param enabled 是否启用紧凑顶部栏。
+   * @returns 无返回值。
+   */
+  public setCompactMainWindowHeader(enabled: boolean): void {
+    this.compactMainWindowHeader = normalizeCompactMainWindowHeader(enabled)
+  }
+
+  /**
+   * 获取当前主窗口顶部栏高度。
+   * @returns 当前主窗口顶部栏高度，单位为像素。
+   */
+  public getMainWindowHeaderHeight(): number {
+    return resolveMainWindowHeaderHeight(this.compactMainWindowHeader)
+  }
+
+  private isLeftMouseButton(button: unknown): boolean {
+    return Number(button) === 1
+  }
+
+  private isPointInsideMainWindow(point: { x: number; y: number }): boolean {
+    if (!this.mainWindow) return false
+
+    const bounds = this.mainWindow.getBounds()
+    return (
+      point.x >= bounds.x &&
+      point.x <= bounds.x + bounds.width &&
+      point.y >= bounds.y &&
+      point.y <= bounds.y + bounds.height
+    )
+  }
+
+  private clearPendingBlurHideTimer(): void {
+    if (this.pendingBlurHideTimer) {
+      clearTimeout(this.pendingBlurHideTimer)
+      this.pendingBlurHideTimer = null
+    }
+  }
+
+  /**
+   * 判断当前是否应阻止失焦自动隐藏，E2E 模式始终保持窗口可见。
+   *
+   * @returns 需要阻止失焦隐藏时返回 true。
+   */
+  private isBlurHideSuppressed(): boolean {
+    return (
+      process.env.ZTOOLS_E2E === '1' ||
+      this.suppressBlurHide ||
+      this.modalDialogBlurHideSuppressed ||
+      this.transientBlurSuppressTimer !== null
+    )
+  }
+
+  /**
+   * 短暂抑制 blur 自动隐藏窗口。
+   *
+   * 窗口激活/呼出瞬间（尤其在其它应用处于全屏时抢焦点）系统可能补发一次瞬时 blur，
+   * 若不抑制会立刻触发 hideWindow 造成"一闪而过"。多次调用取最长的抑制时长，
+   * 避免后一次较短抑制把先前更长的抑制提前释放（例如双击唤醒与普通呼出叠加）。
+   */
+  private suppressBlurHideTransiently(durationMs: number): void {
+    const until = Date.now() + durationMs
+    if (this.transientBlurSuppressTimer && this.transientBlurSuppressUntil >= until) {
+      return
+    }
+    if (this.transientBlurSuppressTimer) {
+      clearTimeout(this.transientBlurSuppressTimer)
+    }
+    this.transientBlurSuppressUntil = until
+    this.transientBlurSuppressTimer = setTimeout(() => {
+      this.transientBlurSuppressTimer = null
+      this.transientBlurSuppressUntil = 0
+    }, durationMs)
+  }
+
+  private beginModalDialogBlurHideSuppression(): void {
+    if (this.modalDialogBlurHideReleaseTimer) {
+      clearTimeout(this.modalDialogBlurHideReleaseTimer)
+      this.modalDialogBlurHideReleaseTimer = null
+    }
+
+    this.modalDialogBlurHideSuppressionDepth += 1
+    this.modalDialogBlurHideSuppressed = true
+  }
+
+  private endModalDialogBlurHideSuppression(releaseDelayMs: number): void {
+    this.modalDialogBlurHideSuppressionDepth = Math.max(
+      0,
+      this.modalDialogBlurHideSuppressionDepth - 1
+    )
+    if (this.modalDialogBlurHideSuppressionDepth > 0) return
+
+    if (this.modalDialogBlurHideReleaseTimer) {
+      clearTimeout(this.modalDialogBlurHideReleaseTimer)
+    }
+
+    this.modalDialogBlurHideReleaseTimer = setTimeout(() => {
+      this.modalDialogBlurHideSuppressed = false
+      this.modalDialogBlurHideReleaseTimer = null
+    }, releaseDelayMs)
+  }
+
+  private isPromiseLike<T>(value: T | PromiseLike<T>): value is PromiseLike<T> {
+    return (
+      value !== null &&
+      (typeof value === 'object' || typeof value === 'function') &&
+      typeof (value as { then?: unknown }).then === 'function'
+    )
+  }
+
+  private deferBlurHideUntilMouseUp(): void {
+    this.pendingBlurHideOnMouseUp = true
+    this.clearPendingBlurHideTimer()
+
+    // 兜底：如果系统没有发出 mouseup，不让 pending 状态永久阻止窗口关闭。
+    this.pendingBlurHideTimer = setTimeout(() => {
+      this.pendingBlurHideTimer = null
+      if (!this.pendingBlurHideOnMouseUp) return
+
+      this.pendingBlurHideOnMouseUp = false
+      if (this.isBlurHideSuppressed()) return
+      if (this.mainWindow?.isFocused()) return
+      if (pluginManager.isPluginViewFocused()) return
+
+      this.lastBlurHideTime = Date.now()
+      this.hideWindow(false)
+    }, 15000)
+  }
+
+  private resolveDeferredBlurHideOnMouseUp(): void {
+    this.pendingBlurHideOnMouseUp = false
+    this.clearPendingBlurHideTimer()
+
+    this.resolveMouseUpVisibility()
+  }
+
+  private resolveMouseUpVisibility(): void {
+    if (!this.mainWindow?.isVisible()) return
+    if (this.isBlurHideSuppressed()) return
+
+    // 拖拽最终落在窗口内时保持窗口；落在窗口外时按普通外部点击处理并关闭。
+    const cursorPoint = screen.getCursorScreenPoint()
+    if (this.isPointInsideMainWindow(cursorPoint)) {
+      if (!this.mainWindow.isFocused() && !pluginManager.isPluginViewFocused()) {
+        this.mainWindow.focus()
+      }
+      return
+    }
+
+    this.lastBlurHideTime = Date.now()
+    this.hideWindow(false)
+  }
+
+  private startMouseStateTracking(): void {
+    if (this.mouseStateTrackingStarted) return
+    this.mouseStateTrackingStarted = true
+
+    // 使用主进程的全局鼠标事件，而不是渲染层 drag 事件，因为 blur 会早于文件进入渲染层发生。
+    globalInputManager.on(WINDOW_BLUR_DRAG_INPUT_CONSUMER, 'mousedown', (event) => {
+      if (this.isLeftMouseButton(event.button)) {
+        this.leftMouseDown = true
+      }
+    })
+
+    globalInputManager.on(WINDOW_BLUR_DRAG_INPUT_CONSUMER, 'mouseup', (event) => {
+      if (!this.isLeftMouseButton(event.button)) return
+
+      this.leftMouseDown = false
+      if (this.pendingBlurHideOnMouseUp) {
+        this.resolveDeferredBlurHideOnMouseUp()
+      }
+    })
+
+    globalInputManager.acquire(WINDOW_BLUR_DRAG_INPUT_CONSUMER)
+  }
+
+  /**
+   * 获取鼠标所在显示器的工作区尺寸和位置
+   */
+  private getDisplayAtCursor(): {
+    width: number
+    height: number
+    x: number
+    y: number
+    id: number
+  } {
+    const cursorPoint = screen.getCursorScreenPoint()
+    const display = screen.getDisplayNearestPoint(cursorPoint)
+    return {
+      ...display.workArea,
+      id: display.id
+    }
+  }
+
+  /**
+   * 获取当前显示器 ID（基于窗口位置）
+   */
+  public getCurrentDisplayId(): number | null {
+    if (!this.mainWindow) return null
+    const [x, y] = this.mainWindow.getPosition()
+    const display = screen.getDisplayNearestPoint({ x, y })
+    return display.id
+  }
+
+  /**
+   * 创建主窗口
+   *
+   * @returns 创建完成的主窗口实例。
+   */
+  public createWindow(): BrowserWindow {
+    // 智能检测：在鼠标所在的显示器上打开窗口
+    const { width, height, x: displayX, y: displayY } = this.getDisplayAtCursor()
+
+    // 创建窗口前读取布局偏好，避免首次显示后再跳变高度。
+    const settings = databaseAPI.dbGet('settings-general')
+    this.setCompactMainWindowHeader(settings?.compactMainWindowHeader === true)
+    const initialHeight = this.getMainWindowHeaderHeight()
+
+    // 根据平台设置不同的窗口配置
+    const windowConfig: Electron.BrowserWindowConstructorOptions = {
+      type: 'panel',
+      title: 'ZTools',
+      width: WINDOW_WIDTH,
+      height: initialHeight,
+      alwaysOnTop: true,
+      // 基于最大窗口高度计算居中位置，确保窗口扩展时不会超出屏幕
+      x: displayX + Math.floor((width - WINDOW_WIDTH) / 2),
+      y: displayY + Math.floor((height - WINDOW_DEFAULT_HEIGHT) / 2),
+      frame: false, // 无边框
+      resizable: false, // 禁止用户手动调整窗口大小
+      maximizable: false, // 禁用最大化
+      skipTaskbar: true,
+      show: false,
+      hasShadow: true, // 启用窗口阴影（可调整为 false 来移除阴影）
+      webPreferences: {
+        preload: getPreloadPath(),
+        backgroundThrottling: false, // 窗口最小化时是否继续动画和定时器
+        contextIsolation: true, // 禁用上下文隔离, 渲染进程和preload共用window对象
+        nodeIntegration: false, // 渲染进程禁止直接使用 Node
+        spellcheck: false, // 禁用拼写检查
+        webSecurity: false
+      }
+    }
+
+    // macOS 系统配置
+    if (platform.isMacOS) {
+      windowConfig.transparent = true
+      windowConfig.vibrancy = 'fullscreen-ui'
+    }
+    // Windows 系统配置（不设置 transparent，让 setBackgroundMaterial 生效）
+    else if (platform.isWindows) {
+      windowConfig.backgroundColor = '#00000000'
+    }
+    // Linux 系统配置
+    else if (platform.isLinux) {
+      // 不设置 type: 'panel'：X11 下 panel 类型会启用 focus-follows-mouse，
+      // 会导致鼠标移出窗口时 blur 就被触发从而隐藏窗口。
+      // Linux 下我们通过 setAlwaysOnTop 保持置顶层级，不需要 panel 类型。
+      delete windowConfig.type
+    }
+
+    this.mainWindow = new BrowserWindow(windowConfig)
+
+    // 强化置顶层级并允许在所有桌面和全屏应用上显示。
+    // 跳过进程类型变换（skipTransformProcessType）：本应用以 LSUIElement + app.dock.hide()
+    // 自行维持 accessory 状态，而该变换是异步的，会在窗口显示后异步隐藏/重排窗口，是面板
+    // “一闪而过”或落到桌面 Space 的根源。
+    this.mainWindow.setVisibleOnAllWorkspaces(true, {
+      visibleOnFullScreen: true,
+      skipTransformProcessType: true
+    })
+    if (platform.isMacOS) {
+      this.mainWindow.setAlwaysOnTop(true, 'modal-panel', 1)
+    } else {
+      this.mainWindow.setAlwaysOnTop(true)
+    }
+
+    // Windows 11 根据用户配置设置背景材质
+    if (platform.isWindows) {
+      this.applyWindowMaterialFromSettings()
+    }
+
+    // 禁用缩放功能
+    this.mainWindow.webContents.setZoomFactor(1.0) // 重置缩放为 100%
+    this.mainWindow.webContents.setVisualZoomLevelLimits(1, 1) // 禁用未来缩放
+
+    // 拦截缩放快捷键 (Ctrl+Plus, Ctrl+Minus, Ctrl+0, Ctrl+Wheel)
+    // 同时监听应用快捷键
+    this.mainWindow.webContents.on('before-input-event', (event, input) => {
+      // 拦截缩放快捷键
+      if (input.control || input.meta) {
+        if (
+          input.key === '=' ||
+          input.key === '+' ||
+          input.key === '-' ||
+          input.key === '_' ||
+          input.key === '0'
+        ) {
+          event.preventDefault()
+          return
+        }
+      }
+
+      // 检查应用快捷键（仅在按键按下时触发，且未打开插件时生效）
+      if (input.type === 'keyDown') {
+        if (
+          (input.key === 'w' || input.key === 'W') &&
+          (input.meta || input.control) &&
+          !input.shift &&
+          !input.alt
+        ) {
+          const settings = databaseAPI.dbGet('settings-general') || {}
+          const closeShortcutEnabled = settings?.builtinAppShortcutsEnabled?.closePlugin !== false
+          if (!closeShortcutEnabled) {
+            // 禁用时不拦截，让按键正常传到渲染进程（供 HotkeyInput 录制）
+            return
+          }
+        }
+
+        // 只在主搜索界面生效，插件打开时忽略应用快捷键
+        if (pluginManager.getCurrentPluginPath() !== null) {
+          return
+        }
+
+        const shortcut = this.buildShortcutString(input)
+        const target = this.appShortcuts.get(shortcut)
+        if (target) {
+          console.log(`应用快捷键触发: ${shortcut} -> ${target}`)
+          event.preventDefault()
+          this.handleAppShortcut(target)
+        }
+      }
+    })
+
+    // 加载页面
+    if (is.dev && process.env['ELECTRON_RENDERER_URL']) {
+      this.mainWindow.loadURL(process.env['ELECTRON_RENDERER_URL'])
+    } else {
+      const rendererPath = getRendererPath('index.html')
+      console.log('[Window] 生产模式下加载文件:', rendererPath)
+      this.mainWindow.loadFile(rendererPath)
+    }
+
+    // 等待页面加载完成后再处理错误
+    this.mainWindow.webContents.on('did-fail-load', (_event, errorCode, errorDescription) => {
+      console.error('[Window] 页面加载失败:', errorCode, errorDescription)
+    })
+
+    this.mainWindow.webContents.on('did-finish-load', () => {
+      console.log('[Window] 页面加载成功!')
+    })
+
+    // 监听主渲染进程导航事件，检测刷新（跳转到自身）
+    // 若当前有插件视图显示，则将其从 contentView 移除（不销毁），避免叠层问题
+    this.mainWindow.webContents.on(
+      'did-start-navigation',
+      (_event, url, isInPlace, isMainFrame) => {
+        if (!isMainFrame || isInPlace) return
+        const currentUrl = this.mainWindow?.webContents.getURL()
+        if (currentUrl && url === currentUrl && pluginManager.getCurrentPluginPath() !== null) {
+          pluginManager.detachPluginViewOnRefresh()
+        }
+      }
+    )
+
+    // 监听主窗口 webContents 的焦点事件
+    this.mainWindow.webContents.on('focus', () => {
+      // 只在非恢复焦点状态时才更新 lastFocusTarget，避免显示窗口流程中被意外覆盖
+      if (!this.isRestoringFocus) {
+        this.updateFocusTarget('mainWindow')
+      }
+    })
+
+    this.mainWindow.on('blur', () => {
+      if (this.isBlurHideSuppressed()) return
+
+      // 左键仍按下时可能是从外部拖文件进窗口，先等 mouseup 再决定是否隐藏。
+      if (this.leftMouseDown) {
+        this.deferBlurHideUntilMouseUp()
+        return
+      }
+
+      if (platform.isLinux) {
+        // Linux 上去掉了 type:'panel'，现在 blur 只会在真正点击其他窗口时触发。
+        // 但插件 WebContentsView 获焦仍会触发 blur，需延迟排除。
+        if (this.blurHideTimer) {
+          clearTimeout(this.blurHideTimer)
+          this.blurHideTimer = null
+        }
+        this.blurHideTimer = setTimeout(() => {
+          this.blurHideTimer = null
+          if (this.isBlurHideSuppressed()) return
+          // 主窗口重新获焦 → 不隐藏
+          if (this.mainWindow?.isFocused()) return
+          // 插件视图持有焦点（应用内部切换）→ 不隐藏
+          if (pluginManager.isPluginViewFocused()) return
+          // 确认是点击了其他窗口，隐藏
+          this.lastBlurHideTime = Date.now()
+          this.hideWindow(false)
+        }, 150)
+      } else {
+        // macOS / Windows：原有行为不变
+        this.lastBlurHideTime = Date.now()
+        this.hideWindow(false)
+      }
+    })
+
+    if (process.env.ZTOOLS_E2E !== '1') {
+      // 系统级鼠标监听不属于界面冒烟测试范围，避免请求权限和产生全局副作用。
+      this.startMouseStateTracking()
+    }
+
+    this.mainWindow.on('show', () => {
+      // Space 迁移中的透明显示只用于登记窗口归属，避免提前聚焦搜索框或插件。
+      if (this.isPreparingMacSpace) return
+
+      // 开始恢复焦点流程，防止 focus 事件监听器修改 lastFocusTarget
+      this.isRestoringFocus = true
+      const savedFocusTarget = this.lastFocusTarget
+
+      // 恢复上次的焦点状态
+      // 加载中的插件尚无视图可聚焦，先让宿主接收关闭等键盘操作。
+      if (
+        savedFocusTarget === 'mainWindow' ||
+        savedFocusTarget === null ||
+        pluginManager.getCurrentPluginView() === null
+      ) {
+        this.mainWindow?.webContents.focus()
+        this.mainWindow?.webContents.send('focus-search', this.previousActiveWindow || null)
+      } else {
+        // 如果有插件在显示（且上次不是主窗口），聚焦插件
+        pluginManager.focusPluginView()
+        // 修复部分 Windows 系统窗口隐藏再显示后插件白屏：
+        // 延迟到下一 tick 执行，避免与窗口 show 动画在同一 vsync 合并导致重绘失效
+        setImmediate(() => pluginManager.forceRepaintCurrentView())
+      }
+
+      // 恢复完成，清除标志位
+      this.isRestoringFocus = false
+    })
+
+    // 阻止窗口被销毁（Command+W 时隐藏而不是关闭）
+    this.mainWindow.on('close', (event) => {
+      if (process.env.ZTOOLS_E2E !== '1' && !this.isQuitting) {
+        event.preventDefault()
+
+        // 若当前处于插件页面，先退出插件回到主搜索框
+        if (pluginManager.getCurrentPluginPath() !== null) {
+          pluginManager.handlePluginEsc()
+          return
+        }
+
+        // 如果刚刚（100ms 内）触发过插件 ESC，则不再执行 mainWindow.hide，
+        // 避免快速连续操作导致窗口被错误隐藏
+        if (pluginManager.shouldSuppressMainHide()) {
+          console.log('[Window] 检测到短时间内插件 ESC，跳过 mainWindow.hide')
+          return
+        }
+
+        this.mainWindow?.hide()
+      }
+    })
+    // clipboardManager.setWindowFloating(this.mainWindow.getNativeWindowHandle())
+
+    // 从数据库加载唤醒黑名单
+    const initSettings = databaseAPI.dbGet('settings-general')
+    if (initSettings?.wakeupBlacklist) {
+      this.wakeupBlacklist = initSettings.wakeupBlacklist
+    }
+
+    return this.mainWindow
+  }
+
+  /**
+   * 创建系统托盘
+   */
+  public createTray(): void {
+    // 创建托盘图标
+    let icon: Electron.NativeImage
+
+    if (platform.isMacOS) {
+      // macOS 使用 Template 模式的图标（会自动适配明暗主题）
+      // 使用 dark 版本作为模板图标
+      icon = nativeImage.createFromPath(trayIcon)
+      // 设置为模板图标（适配明暗模式）
+      icon.setTemplateImage(true)
+    } else {
+      // Windows/Linux - 根据系统主题选择图标
+      // 暗色模式用 light（白色图标），亮色模式用 dark（黑色图标）
+      // const iconPath = nativeTheme.shouldUseDarkColors ? trayIconLight : trayIcon
+      icon = nativeImage.createFromPath(windowsIcon)
+      icon.setTemplateImage(false)
+    }
+
+    this.tray = new Tray(icon)
+
+    // 设置托盘提示文字
+    this.tray.setToolTip('ZTools')
+
+    // 创建右键菜单
+    this.createTrayMenu()
+
+    if (platform.isLinux && this.trayMenu) {
+      // Linux 下往往无法触发 click 事件，直接使用原生菜单
+      this.tray.setContextMenu(this.trayMenu)
+    } else {
+      // 左键点击：切换窗口显示
+      this.tray.on('click', () => {
+        this.toggleWindow()
+      })
+
+      // 右键点击：显示菜单
+      this.tray.on('right-click', () => {
+        if (this.tray && this.trayMenu) {
+          this.tray.popUpContextMenu(this.trayMenu)
+        }
+      })
+    }
+  }
+
+  /**
+   * 创建托盘菜单
+   *
+   * @returns 无返回值。
+   */
+  private createTrayMenu(): void {
+    if (!this.tray) return
+
+    // 使用普通菜单项显示游戏模式状态，避免原生 checkbox 为整个菜单预留勾选栏。
+    this.trayMenu = Menu.buildFromTemplate([
+      {
+        label: '显示/隐藏',
+        click: () => {
+          this.toggleWindow()
+        }
+      },
+      {
+        label: dndManager.manualEnabled ? '游戏模式 ✓' : '游戏模式',
+        click: () => {
+          dndManager.toggleManual()
+          this.refreshTrayMenu()
+        }
+      },
+      {
+        type: 'separator'
+      },
+      {
+        label: '设置',
+        click: () => {
+          this.showSettings()
+        }
+      },
+      {
+        type: 'separator'
+      },
+      {
+        label: '重启',
+        click: () => {
+          this.isQuitting = true
+          app.relaunch()
+          app.quit()
+        }
+      },
+      {
+        label: '退出',
+        click: () => {
+          this.isQuitting = true
+          app.quit()
+        }
+      }
+    ])
+  }
+
+  public refreshTrayMenu(): void {
+    if (!this.tray) return
+    this.createTrayMenu()
+    if (platform.isLinux) {
+      this.tray.setContextMenu(this.trayMenu)
+    }
+  }
+
+  /**
+   * 获取主窗口实例
+   */
+  public getMainWindow(): BrowserWindow | null {
+    return this.mainWindow
+  }
+
+  /**
+   * 判断是否为双击修饰键快捷键（如 "Ctrl+Ctrl"）
+   */
+  private isDoubleTapShortcut(shortcut: string): boolean {
+    const parts = shortcut.split('+')
+    return (
+      parts.length === 2 && parts[0] === parts[1] && WindowManager.MODIFIER_NAMES.includes(parts[0])
+    )
+  }
+
+  /**
+   * 注册全局快捷键（支持双击修饰键）
+   */
+  public registerShortcut(shortcut?: string): boolean {
+    const keyToRegister = shortcut || this.currentShortcut
+
+    // 保存旧的快捷键信息，用于注册失败时回滚
+    const oldShortcut = this.currentShortcut
+    const oldIsDoubleTapMode = this.isDoubleTapMode
+
+    // 注销旧的呼出快捷键（仅注销当前快捷键，不影响其他全局快捷键）
+    if (this.isDoubleTapMode) {
+      const oldModifier = this.currentShortcut.split('+')[0]
+      doubleTapManager.unregister(oldModifier)
+    } else {
+      globalShortcut.unregister(this.currentShortcut)
+    }
+
+    // 双击修饰键模式：通过 doubleTapManager 注册
+    if (this.isDoubleTapShortcut(keyToRegister)) {
+      const modifier = keyToRegister.split('+')[0]
+      doubleTapManager.register(modifier, () => {
+        if (!dndManager.shouldIgnoreHotkeys()) this.toggleWindowFromDoubleTap()
+      })
+      this.currentShortcut = keyToRegister
+      this.isDoubleTapMode = true
+      console.log(`双击修饰键呼出快捷键 ${keyToRegister} 注册成功`)
+      return true
+    }
+
+    // 普通快捷键模式：通过 globalShortcut 注册
+    const ret = globalShortcut.register(keyToRegister, () => {
+      if (!dndManager.shouldIgnoreHotkeys()) this.toggleWindow()
+    })
+
+    if (!ret) {
+      console.error(`快捷键注册失败: ${keyToRegister} 已被占用，回滚到旧快捷键: ${oldShortcut}`)
+      // 注册失败，回滚：重新注册旧的快捷键
+      if (oldIsDoubleTapMode) {
+        const oldModifier = oldShortcut.split('+')[0]
+        doubleTapManager.register(oldModifier, () => {
+          if (!dndManager.shouldIgnoreHotkeys()) this.toggleWindowFromDoubleTap()
+        })
+      } else {
+        globalShortcut.register(oldShortcut, () => {
+          if (!dndManager.shouldIgnoreHotkeys()) this.toggleWindow()
+        })
+      }
+      return false
+    } else {
+      this.currentShortcut = keyToRegister
+      this.isDoubleTapMode = false
+      console.log(`快捷键 ${keyToRegister} 注册成功`)
+    }
+
+    return ret
+  }
+
+  /**
+   * 设置主窗口关闭后需要恢复的前台窗口。
+   * @param windowInfo 要记录的窗口信息，传入 null 时清除已有记录。
+   * @returns 无返回值。
+   */
+  public setPreviousActiveWindow(windowInfo: typeof this.previousActiveWindow): void {
+    this.previousActiveWindow = windowInfo
+  }
+
+  /**
+   * 捕获当前前台窗口，供不显示主窗口的启动链路保留本次操作目标。
+   * @returns 捕获到的窗口信息；无法获取时返回 null 并清除旧记录。
+   */
+  public captureCurrentActiveWindow(): typeof this.previousActiveWindow {
+    // 即使本次捕获失败也要清除旧值，避免后续 API 误用上一次启动留下的窗口。
+    const currentWindow = clipboardManager.getCurrentWindow()
+    this.previousActiveWindow = currentWindow
+    return currentWindow
+  }
+
+  /**
+   * 记录当前的焦点状态（在隐藏之前调用）
+   * 注意：焦点状态现在通过事件监听实时跟踪,此方法仅用于确保状态正确
+   */
+  private recordFocusState(): void {
+    // 如果没有插件在运行,焦点一定在主窗口
+    if (pluginManager.getCurrentPluginPath() === null) {
+      this.updateFocusTarget('mainWindow')
+    }
+  }
+
+  /**
+   * 切换窗口显示/隐藏
+   */
+  private toggleWindow(): void {
+    if (!this.mainWindow) return
+
+    const isFocused = this.mainWindow.isFocused()
+    const isVisible = this.mainWindow.isVisible()
+
+    // 判断窗口是否聚焦显示
+    // 修复：同时检查聚焦和可见状态，避免alert弹窗后判断错误
+    if (isFocused && isVisible) {
+      // 窗口已显示且聚焦 → 隐藏
+
+      // 记录当前的焦点状态（在隐藏之前）
+      this.recordFocusState()
+
+      this.mainWindow.blur()
+      this.mainWindow.hide()
+      this.restorePreviousWindow()
+    } else {
+      // 窗口已隐藏或失焦 → 显示并强制激活
+      // 但如果是刚刚因为 blur 事件隐藏的（点击托盘图标导致失焦），
+      // 说明用户意图是隐藏窗口，不应再重新显示
+      const timeSinceBlurHide = Date.now() - this.lastBlurHideTime
+      if (timeSinceBlurHide < 300) {
+        return
+      }
+      this.showWindow()
+      if (platform.isWindows) {
+        this.scheduleWindowsHotkeyRefocus()
+      }
+    }
+  }
+
+  private toggleWindowFromDoubleTap(): void {
+    if (!this.mainWindow) return
+
+    const willShow = !(this.mainWindow.isFocused() && this.mainWindow.isVisible())
+    if (willShow) {
+      // Double-tap 的 uiohook 回调刚触发后，系统可能补发一次 transient blur，短暂忽略避免刚显示就关闭。
+      this.suppressBlurHideTransiently(350)
+    }
+
+    this.toggleWindow()
+
+    if (willShow && platform.isWindows) {
+      if (this.doubleTapFocusTimer) clearTimeout(this.doubleTapFocusTimer)
+      // Windows 上延后一小段时间再聚焦，避开窗口 show 和系统焦点切换尚未稳定的阶段。
+      this.doubleTapFocusTimer = setTimeout(() => {
+        this.refocusSearchAfterDoubleTap()
+        this.doubleTapFocusTimer = null
+      }, 80)
+    }
+  }
+
+  /**
+   * 强制激活窗口（解决alert等弹窗后无法唤起的问题）。
+   *
+   * macOS 统一保持非激活 panel 语义：panel 窗口 show() 即成为 key window 且不激活应用
+   * （Spotlight 式面板），因此不调用 app.focus({steal:true})，避免 accessory 应用被激活后
+   * 带着面板切换到桌面 Space。前台应用处于全屏时额外重申“canJoinAllSpaces +
+   * fullScreenAuxiliary”集合行为，让面板进入当前全屏 Space；重申时跳过进程类型变换
+   * （skipTransformProcessType），该变换是异步的，会在显示后异步隐藏/重排窗口。
+   *
+   * @returns 无返回值
+   */
+  private forceActivateWindow(): void {
+    if (!this.mainWindow) return
+
+    if (platform.isMacOS) {
+      const fullscreen = this.isForegroundAppFullscreen()
+      // 抑制呼出瞬间系统补发的 blur，避免窗口刚显示就被误隐藏
+      this.suppressBlurHideTransiently(200)
+      this.mainWindow.setAlwaysOnTop(true, 'modal-panel', 1)
+
+      // 全屏场景：用“空间锚点”把面板带入当前全屏 Space，再以非激活 panel 语义显示
+      if (fullscreen) {
+        // 重申集合行为（跳过进程类型变换），保证 panel 具有 canJoinAllSpaces + fullScreenAuxiliary
+        this.mainWindow.setVisibleOnAllWorkspaces(true, {
+          visibleOnFullScreen: true,
+          skipTransformProcessType: true
+        })
+        this.prepareMacOSFullscreenSpace()
+        this.mainWindow.show()
+        this.mainWindow.focus()
+        return
+      }
+
+      // 普通桌面不再需要锚点，释放窗口资源；下一次全屏呼出时按需重建。
+      this.releaseMacOSSpaceAnchor()
+
+      // 非全屏场景保持非激活 panel，保留原应用的前台状态。
+      this.mainWindow.show()
+      return
+    }
+
+    // Windows / Linux：显示后重申层级并聚焦
+    this.mainWindow.show()
+    this.mainWindow.setAlwaysOnTop(true)
+    this.mainWindow.focus()
+  }
+
+  /**
+   * 确保 macOS 全屏场景使用的“空间锚点”窗口存在。
+   *
+   * 背景：panel 窗口自带 canJoinAllSpaces + fullScreenAuxiliary 集合行为，但当窗口在某个
+   * 全屏 Space 中被隐藏（orderOut）后，WindowServer 会把它的 Space 归属收敛到当时所在的
+   * Space；若该 Space 后续消失（例如用户退出全屏），窗口会被钉在失效 Space 上，再次呼出时
+   * 无法进入当前全屏 Space，表现为“只在桌面显示、全屏看不到”。Electron 的 ElectronNSPanel
+   * 对集合行为只增不减，重复调用 setVisibleOnAllWorkspaces 也无法恢复归属。
+   *
+   * 方案：创建一个 1x1 不可见 panel 窗口作为锚点。macOS 上子窗口跟随父窗口所在的 Space，
+   * 临时把主窗口挂上锚点即可登记到当前 Space。正式显示前必须解除父子关系，否则挂接子窗口
+   * 时会直接显示主窗口，跳过原本的系统唤出动画。锚点在全屏呼出时按需创建并复用，普通桌面
+   * 呼出时释放，避免离开全屏场景后持续保留窗口资源。
+   *
+   * @returns 空间锚点窗口；主窗口不存在时返回 null。
+   */
+  private ensureMacOSSpaceAnchor(): BrowserWindow | null {
+    if (!this.mainWindow) return null
+
+    const anchorAlive = !!this.macSpaceAnchor && !this.macSpaceAnchor.isDestroyed()
+    if (!anchorAlive) {
+      // 创建 1x1 透明、不可聚焦、无阴影的锚点窗口，仅用于携带 Space 归属
+      this.macSpaceAnchor = new BrowserWindow({
+        type: 'panel',
+        width: 1,
+        height: 1,
+        x: 0,
+        y: 0,
+        frame: false,
+        transparent: true,
+        opacity: 0,
+        show: false,
+        skipTaskbar: true,
+        focusable: false,
+        hasShadow: false,
+        resizable: false,
+        minimizable: false,
+        maximizable: false
+      })
+      // 锚点同样声明全 Space + 全屏辅助，保证其子窗口可以出现在任何全屏 Space
+      this.macSpaceAnchor.setVisibleOnAllWorkspaces(true, {
+        visibleOnFullScreen: true,
+        skipTransformProcessType: true
+      })
+      // 与主窗口保持一致的置顶层级，避免子窗口层级被压低
+      this.macSpaceAnchor.setAlwaysOnTop(true, 'modal-panel', 1)
+      // 锚点与主窗口放在同一显示器，避免子窗口被限制到其它屏幕
+      const [mainX, mainY] = this.mainWindow.getPosition()
+      this.syncAnchorToDisplayOf(mainX, mainY)
+      // 以非激活方式登记到当前 Space，且不抢占焦点
+      this.macSpaceAnchor.showInactive()
+    }
+
+    return this.macSpaceAnchor
+  }
+
+  /**
+   * 释放普通桌面呼出时已不需要的空间锚点，下次全屏呼出可重新创建。
+   * @returns 无返回值。
+   */
+  private releaseMacOSSpaceAnchor(): void {
+    const anchor = this.macSpaceAnchor
+    // 主窗口已在迁移结束时解除父子关系，销毁锚点不会连带关闭主窗口。
+    this.macSpaceAnchor = null
+    if (anchor && !anchor.isDestroyed()) anchor.destroy()
+  }
+
+  /**
+   * 透明地把隐藏的主窗口迁移到当前全屏 Space，再恢复为独立窗口以保留系统唤出动画。
+   * @returns 无返回值。
+   */
+  private prepareMacOSFullscreenSpace(): void {
+    const mainWindow = this.mainWindow
+    if (!mainWindow || mainWindow.isVisible()) return
+
+    const anchor = this.ensureMacOSSpaceAnchor()
+    if (!anchor) return
+
+    // 挂接子窗口会直接将其显示，因此先透明迁移并跳过这一阶段的焦点恢复。
+    const opacity = mainWindow.getOpacity()
+    this.isPreparingMacSpace = true
+    try {
+      mainWindow.setOpacity(0)
+      mainWindow.setParentWindow(anchor)
+      mainWindow.showInactive()
+    } finally {
+      // Space 归属登记后移除父窗口；恢复隐藏和透明度，让随后 show() 执行系统动画。
+      mainWindow.hide()
+      mainWindow.setParentWindow(null)
+      mainWindow.setOpacity(opacity)
+      this.isPreparingMacSpace = false
+    }
+  }
+
+  /**
+   * 判断当前前台应用是否处于全屏。
+   * @returns 前台应用为全屏窗口时返回 true；无法获取或非全屏时返回 false
+   */
+  private isForegroundAppFullscreen(): boolean {
+    const activeWindow = NativeWindowManager.getActiveWindow()
+    if (!activeWindow) return false
+
+    return isFullscreenWindow(activeWindow)
+  }
+
+  private refocusSearchAfterDoubleTap(): void {
+    if (!platform.isWindows) return
+    if (!this.mainWindow?.isVisible()) return
+
+    this.refocusActiveContentOnWindows()
+  }
+
+  private scheduleWindowsHotkeyRefocus(): void {
+    if (!platform.isWindows) return
+    if (this.windowsHotkeyFocusTimer) clearTimeout(this.windowsHotkeyFocusTimer)
+    // Windows 前台键盘目标有时会晚于 show/focus 稳定，延后一小段时间再补激活。
+    this.windowsHotkeyFocusTimer = setTimeout(() => {
+      this.refocusActiveContentOnWindows()
+      this.windowsHotkeyFocusTimer = null
+    }, 80)
+  }
+
+  /**
+   * 在 Windows 激活窗口后将键盘焦点交给实际已挂载的插件或宿主。
+   * @returns 无返回值
+   */
+  private refocusActiveContentOnWindows(): void {
+    if (!platform.isWindows) return
+    if (!this.mainWindow?.isVisible()) return
+
+    app.focus({ steal: true })
+    this.mainWindow.show()
+    this.mainWindow.moveTop()
+    // Electron 的 isFocused 有时已经为 true，但 Windows 前台键盘目标仍未切到本应用；这里用原生激活补齐。
+    NativeWindowManager.activateWindow(process.pid)
+    this.mainWindow.focus()
+    // 加载占位不代表已有可聚焦的视图，必须保留宿主作为键盘目标。
+    if (pluginManager.getCurrentPluginView() !== null && this.lastFocusTarget !== 'mainWindow') {
+      pluginManager.focusPluginView()
+      setImmediate(() => pluginManager.forceRepaintCurrentView())
+      return
+    }
+
+    this.mainWindow.webContents.focus()
+    this.mainWindow.webContents.send('focus-search', this.previousActiveWindow || null)
+  }
+
+  /**
+   * 保存窗口位置到指定显示器（仅内存）
+   */
+  public saveWindowPosition(displayId: number, x: number, y: number): void {
+    this.windowPositionsByDisplay[displayId] = { x, y }
+  }
+
+  /**
+   * 根据窗口呼出位置策略将窗口移动到目标显示器并定位
+   * - remember：优先恢复该显示器记忆的位置，否则居中
+   * - cursor：鼠标所在显示器居中
+   * - primary：主显示器居中
+   * - lastActive：上次活动窗口所在显示器居中（无记录时 fallback 到鼠标屏）
+   */
+  private moveWindowToCursor(): void {
+    if (!this.mainWindow) return
+
+    let target: { width: number; height: number; x: number; y: number; id: number }
+
+    switch (this.windowPositionStrategy) {
+      case 'primary': {
+        const display = screen.getPrimaryDisplay()
+        target = { ...display.workArea, id: display.id }
+        break
+      }
+      case 'lastActive': {
+        const prev = this.previousActiveWindow
+        if (
+          prev &&
+          typeof prev.x === 'number' &&
+          typeof prev.y === 'number' &&
+          Number.isFinite(prev.x) &&
+          Number.isFinite(prev.y)
+        ) {
+          const centerX =
+            prev.x +
+            (typeof prev.width === 'number' && Number.isFinite(prev.width)
+              ? Math.floor(prev.width / 2)
+              : 0)
+          const centerY =
+            prev.y +
+            (typeof prev.height === 'number' && Number.isFinite(prev.height)
+              ? Math.floor(prev.height / 2)
+              : 0)
+          const display = screen.getDisplayNearestPoint({ x: centerX, y: centerY })
+          target = { ...display.workArea, id: display.id }
+        } else {
+          target = this.getDisplayAtCursor()
+        }
+        break
+      }
+      case 'cursor': {
+        target = this.getDisplayAtCursor()
+        break
+      }
+      case 'remember':
+      default: {
+        const { width, height, x: displayX, y: displayY, id: displayId } = this.getDisplayAtCursor()
+        const savedPosition = this.windowPositionsByDisplay[displayId]
+        if (savedPosition) {
+          this.applyMainWindowPosition(savedPosition.x, savedPosition.y)
+          return
+        }
+        target = { width, height, x: displayX, y: displayY, id: displayId }
+        break
+      }
+    }
+
+    const x = target.x + Math.floor((target.width - WINDOW_WIDTH) / 2)
+    const y = target.y + Math.floor((target.height - WINDOW_DEFAULT_HEIGHT) / 2)
+    this.applyMainWindowPosition(x, y)
+  }
+
+  /**
+   * 应用主窗口位置，并同步“空间锚点”到同一显示器。
+   *
+   * macOS 上子窗口会被限制在父窗口所在显示器，因此若锚点仍在旧显示器，主窗口会被拉回旧屏；
+   * 这里先把锚点移到目标显示器（隐藏状态下主窗口与锚点是脱开的，不会拖拽主窗口），再定位主窗口。
+   *
+   * @param x 目标位置横坐标
+   * @param y 目标位置纵坐标
+   * @returns 无返回值
+   */
+  private applyMainWindowPosition(x: number, y: number): void {
+    if (!this.mainWindow) return
+
+    this.syncAnchorToDisplayOf(x, y)
+    this.mainWindow.setPosition(x, y, false)
+  }
+
+  /**
+   * 把“空间锚点”同步到指定坐标所在显示器。
+   *
+   * 子窗口会被限制在父窗口所在显示器，因此锚点必须与主窗口处于同一显示器；仅在显示器发生变化
+   * 时才移动锚点，避免移动锚点时带着子窗口抖动。锚点移到目标显示器工作区左上角即可（1x1 不可见
+   * 窗口，位置本身无视觉影响）。
+   *
+   * @param x 参考坐标横坐标
+   * @param y 参考坐标纵坐标
+   * @returns 无返回值
+   */
+  private syncAnchorToDisplayOf(x: number, y: number): void {
+    const anchor = this.macSpaceAnchor
+    if (!anchor || anchor.isDestroyed()) return
+
+    const targetDisplay = screen.getDisplayNearestPoint({ x, y })
+    const [anchorX, anchorY] = anchor.getPosition()
+    const anchorDisplay = screen.getDisplayNearestPoint({ x: anchorX, y: anchorY })
+    if (targetDisplay.id === anchorDisplay.id) return
+
+    anchor.setPosition(targetDisplay.workArea.x, targetDisplay.workArea.y, false)
+  }
+
+  /**
+   * 显示窗口
+   */
+  public showWindow(): void {
+    if (!this.mainWindow) return
+
+    // 开始恢复焦点流程，防止 focus 事件监听器修改 lastFocusTarget
+    this.isRestoringFocus = true
+
+    // 取消自动返回搜索定时器
+    this.cancelAutoBackToSearchTimer()
+
+    // 记录打开窗口前的激活窗口
+    const currentWindow = clipboardManager.getCurrentWindow()
+    if (currentWindow) {
+      this.previousActiveWindow = currentWindow
+
+      // 唤醒黑名单检查：当前活动窗口在黑名单中时不弹出
+      if (currentWindow.app) {
+        const wakeupWindow = { ...currentWindow, app: currentWindow.app }
+        if (this.isAppInWakeupBlacklist(wakeupWindow)) {
+          this.isRestoringFocus = false
+          return
+        }
+      }
+    }
+
+    // 移动到鼠标所在显示器（恢复该显示器记忆的位置或居中）
+    this.moveWindowToCursor()
+
+    // mainHide feature 启动时可能把插件视图高度压成 0，窗口重新显示时按需恢复
+    pluginManager.restoreCurrentPluginViewHeightOnWindowShow()
+
+    // 使用强制激活逻辑（注意：show 事件会清除 isRestoringFocus 标志）
+    this.forceActivateWindow()
+  }
+
+  /**
+   * 隐藏主窗口，并按需恢复隐藏前的前台窗口。
+   * @param _restoreFocus 是否恢复隐藏前的前台窗口。
+   * @returns 无返回值。
+   */
+  public hideWindow(_restoreFocus: boolean = true): void {
+    console.log('[Window] 隐藏窗口', _restoreFocus)
+
+    const wasMainWindowVisible = this.mainWindow?.isVisible() === true
+
+    // 只有主窗口实际显示过，才记录并恢复其隐藏前的焦点状态。
+    if (wasMainWindowVisible) {
+      this.recordFocusState()
+    }
+
+    this.mainWindow?.hide()
+    if (_restoreFocus && wasMainWindowVisible) {
+      void this.restorePreviousWindow()
+    }
+
+    // 启动自动返回搜索定时器
+    this.startAutoBackToSearchTimer()
+  }
+
+  public withBlurHideSuppressed<T>(
+    callback: () => PromiseLike<T>,
+    releaseDelayMs?: number
+  ): Promise<T>
+  public withBlurHideSuppressed<T>(callback: () => T, releaseDelayMs?: number): T
+  public withBlurHideSuppressed<T>(
+    callback: () => T | PromiseLike<T>,
+    releaseDelayMs: number = DEFAULT_MODAL_DIALOG_BLUR_HIDE_RELEASE_DELAY_MS
+  ): T | Promise<T> {
+    this.beginModalDialogBlurHideSuppression()
+    try {
+      const result = callback()
+      if (this.isPromiseLike(result)) {
+        return Promise.resolve(result).finally(() => {
+          this.endModalDialogBlurHideSuppression(releaseDelayMs)
+        })
+      }
+
+      this.endModalDialogBlurHideSuppression(releaseDelayMs)
+      return result
+    } catch (error) {
+      this.endModalDialogBlurHideSuppression(releaseDelayMs)
+      throw error
+    }
+  }
+
+  public withBlurHideSuppressedSync<T>(
+    callback: () => T,
+    releaseDelayMs: number = DEFAULT_MODAL_DIALOG_BLUR_HIDE_RELEASE_DELAY_MS
+  ): T {
+    this.beginModalDialogBlurHideSuppression()
+    try {
+      const result = callback()
+      if (this.isPromiseLike(result)) {
+        throw new TypeError('withBlurHideSuppressedSync callback must not return a Promise')
+      }
+
+      this.endModalDialogBlurHideSuppression(releaseDelayMs)
+      return result
+    } catch (error) {
+      this.endModalDialogBlurHideSuppression(releaseDelayMs)
+      throw error
+    }
+  }
+
+  /**
+   * 启动自动返回搜索定时器
+   */
+  private startAutoBackToSearchTimer(): void {
+    // 清除之前的定时器
+    if (this.autoBackToSearchTimer) {
+      clearTimeout(this.autoBackToSearchTimer)
+      this.autoBackToSearchTimer = null
+    }
+
+    // 如果配置为"从不"，不启动定时器
+    if (this.autoBackToSearchConfig === 'never') {
+      return
+    }
+
+    // 获取延时时间（毫秒）
+    const delay = this.getAutoBackToSearchDelay()
+    if (delay === 0) {
+      // 立即返回搜索
+      this.backToSearch()
+      return
+    }
+
+    // 启动定时器
+    this.autoBackToSearchTimer = setTimeout(() => {
+      this.backToSearch()
+      this.autoBackToSearchTimer = null
+    }, delay)
+
+    console.log(`自动返回搜索定时器已启动，延时: ${delay}ms`)
+  }
+
+  /**
+   * 取消自动返回搜索定时器
+   */
+  private cancelAutoBackToSearchTimer(): void {
+    if (this.autoBackToSearchTimer) {
+      clearTimeout(this.autoBackToSearchTimer)
+      this.autoBackToSearchTimer = null
+      console.log('[Window] 自动返回搜索定时器已取消')
+    }
+  }
+
+  /**
+   * 返回搜索界面
+   */
+  private backToSearch(): void {
+    if (!this.mainWindow) return
+
+    pluginManager.hidePluginView()
+    // 通知渲染进程返回搜索并切换模式
+    this.notifyBackToSearch()
+    console.log('[Window] 已触发自动返回搜索')
+  }
+
+  /**
+   * 获取自动返回搜索的延时时间（毫秒）
+   */
+  private getAutoBackToSearchDelay(): number {
+    switch (this.autoBackToSearchConfig) {
+      case 'immediately':
+        return 0
+      case '30s':
+        return 30 * 1000
+      case '1m':
+        return 60 * 1000
+      case '3m':
+        return 3 * 60 * 1000
+      case '5m':
+        return 5 * 60 * 1000
+      case '10m':
+        return 10 * 60 * 1000
+      case 'never':
+      default:
+        return -1 // 不启动定时器
+    }
+  }
+
+  /**
+   * 更新自动返回搜索配置
+   */
+  public async updateAutoBackToSearch(config: string): Promise<void> {
+    this.autoBackToSearchConfig = config
+    console.log('[Window] 更新自动返回搜索配置:', config)
+  }
+
+  /**
+   * 更新窗口呼出位置策略
+   */
+  public async updateWindowPositionStrategy(strategy: string): Promise<void> {
+    this.windowPositionStrategy = strategy
+    console.log('[Window] 更新窗口呼出位置策略:', strategy)
+  }
+
+  /**
+   * 获取打开窗口前激活的窗口
+   */
+  public getPreviousActiveWindow(): typeof this.previousActiveWindow {
+    return this.previousActiveWindow
+  }
+
+  /**
+   * 更新唤醒黑名单（由设置或系统指令调用）
+   */
+  public updateWakeupBlacklist(
+    blacklist: Array<{ app: string; bundleId?: string; label?: string }>
+  ): void {
+    this.wakeupBlacklist = blacklist
+  }
+
+  /**
+   * 检查指定窗口是否在唤醒黑名单中
+   */
+  private isAppInWakeupBlacklist(windowInfo: { app: string; bundleId?: string }): boolean {
+    if (this.wakeupBlacklist.length === 0) return false
+    if (process.platform === 'darwin' && windowInfo.bundleId) {
+      return this.wakeupBlacklist.some((item) => item.bundleId === windowInfo.bundleId)
+    }
+    return this.wakeupBlacklist.some(
+      (item) => item.app.toLowerCase() === windowInfo.app.toLowerCase()
+    )
+  }
+
+  /**
+   * 恢复之前激活的窗口
+   */
+  public async restorePreviousWindow(): Promise<boolean> {
+    if (!this.previousActiveWindow) {
+      console.log('[Window] 没有记录的前一个激活窗口')
+      return false
+    }
+
+    const previousApp = this.previousActiveWindow.app
+    if (!previousApp) {
+      console.log('[Window] 前一个激活窗口缺少应用标识')
+      return false
+    }
+
+    // 忽略同类启动器工具，避免激活冲突
+    const ignoredApps = ['uTools', 'Alfred', 'Raycast', 'Wox', 'Listary']
+    if (ignoredApps.includes(previousApp)) {
+      console.log(`跳过恢复同类工具: ${previousApp}`)
+      return false
+    }
+
+    try {
+      const success = clipboardManager.activateApp(this.previousActiveWindow)
+      if (success) {
+        console.log(`已恢复激活窗口: ${previousApp}`)
+        return true
+      } else {
+        // 静默失败，不报错（可能进程已关闭或窗口已销毁）
+        console.log(`无法恢复窗口: ${previousApp}`)
+        return false
+      }
+    } catch (error) {
+      console.log('[Window] 恢复激活窗口时出现异常:', error)
+      return false
+    }
+  }
+
+  /**
+   * 获取当前快捷键
+   */
+  public getCurrentShortcut(): string {
+    return this.currentShortcut
+  }
+
+  /**
+   * 注销所有快捷键
+   */
+  public unregisterAllShortcuts(): void {
+    globalShortcut.unregisterAll()
+    doubleTapManager.unregisterAll()
+    globalInputManager.release(WINDOW_BLUR_DRAG_INPUT_CONSUMER)
+    this.mouseStateTrackingStarted = false
+    this.isDoubleTapMode = false
+  }
+
+  /**
+   * 设置退出标志（允许窗口真正关闭）
+   */
+  public setQuitting(value: boolean): void {
+    this.isQuitting = value
+  }
+
+  /**
+   * 获取退出标志
+   */
+  public getQuitting(): boolean {
+    return this.isQuitting
+  }
+
+  /**
+   * 设置托盘图标可见性
+   */
+  public setTrayIconVisible(visible: boolean): void {
+    if (visible) {
+      if (!this.tray) {
+        this.createTray()
+      }
+    } else {
+      if (this.tray) {
+        this.tray.destroy()
+        this.tray = null
+        this.trayMenu = null
+      }
+    }
+  }
+
+  /**
+   * 广播窗口材质到所有渲染进程（包括分离窗口和插件）
+   */
+  private broadcastWindowMaterial(material: WindowMaterial): void {
+    // 发送给主窗口
+    this.mainWindow?.webContents.send('update-window-material', material)
+
+    // 发送给所有分离窗口
+    detachedWindowManager.updateAllWindowsMaterial(material)
+
+    // 发送给超级面板窗口
+    superPanelManager.updateWindowMaterial(material)
+
+    // 通知插件主题信息变更
+    this.notifyThemeInfoChanged()
+  }
+
+  /**
+   * 广播主题色到所有渲染进程
+   */
+  public broadcastPrimaryColor(primaryColor: string, customColor?: string): void {
+    const data = { primaryColor, customColor }
+    // 发送给主窗口
+    this.mainWindow?.webContents.send('update-primary-color', data)
+
+    // 发送给所有分离窗口
+    detachedWindowManager.broadcastToAllWindows('update-primary-color', data)
+
+    // 通知插件主题信息变更
+    this.notifyThemeInfoChanged()
+  }
+
+  /**
+   * 广播亚克力透明度到所有渲染进程
+   */
+  public broadcastAcrylicOpacity(lightOpacity: number, darkOpacity: number): void {
+    const data = { lightOpacity, darkOpacity }
+    // 发送给主窗口
+    this.mainWindow?.webContents.send('update-acrylic-opacity', data)
+
+    // 发送给所有分离窗口
+    detachedWindowManager.broadcastToAllWindows('update-acrylic-opacity', data)
+  }
+
+  /**
+   * 应用窗口材质
+   */
+  private applyMaterial(material: WindowMaterial): void {
+    if (!this.mainWindow) return
+    applyWindowMaterial(this.mainWindow, material)
+  }
+
+  /**
+   * 从设置中应用窗口材质（启动时调用）
+   */
+  private applyWindowMaterialFromSettings(): void {
+    try {
+      const settings = databaseAPI.dbGet('settings-general')
+      const savedMaterial = settings?.windowMaterial as WindowMaterial | undefined
+      const material = savedMaterial || getDefaultWindowMaterial()
+
+      console.log('[Window] 从配置读取窗口材质:', material)
+
+      // 如果数据库中没有保存材质配置，保存默认值
+      if (!savedMaterial) {
+        console.log('[Window] 数据库中没有窗口材质配置，保存默认值:', material)
+        const updatedSettings = {
+          ...(settings || {}),
+          windowMaterial: material
+        }
+        databaseAPI.dbPut('settings-general', updatedSettings)
+      }
+
+      this.applyMaterial(material)
+    } catch (error) {
+      console.error('[Window] 读取窗口材质配置失败，使用默认值:', error)
+      const defaultMaterial = getDefaultWindowMaterial()
+      this.applyMaterial(defaultMaterial)
+    }
+  }
+
+  /**
+   * 设置窗口材质（用户在设置中更改时调用）
+   */
+  public setWindowMaterial(material: WindowMaterial): { success: boolean } {
+    if (!this.mainWindow || !platform.isWindows) {
+      return { success: false }
+    }
+
+    this.applyMaterial(material)
+    this.broadcastWindowMaterial(material)
+
+    return { success: true }
+  }
+
+  /**
+   * 获取当前窗口材质
+   */
+  public getWindowMaterial(): WindowMaterial {
+    try {
+      const settings = databaseAPI.dbGet('settings-general')
+      return (settings?.windowMaterial as WindowMaterial) || getDefaultWindowMaterial()
+    } catch (error) {
+      console.error('[Window] 获取窗口材质失败:', error)
+      return getDefaultWindowMaterial()
+    }
+  }
+
+  /**
+   * 设置主题信息变更回调钩子
+   */
+  public setOnThemeInfoChanged(callback: (() => void) | null): void {
+    this.onThemeInfoChanged = callback
+  }
+
+  /**
+   * 通知插件主题信息变更（供外部调用）
+   */
+  public notifyThemeInfoChanged(): void {
+    this.onThemeInfoChanged?.()
+  }
+
+  /**
+   * 显示设置页面
+   */
+  public async showSettings(): Promise<void> {
+    if (!this.mainWindow) return
+
+    // 如果当前有插件在显示，先隐藏插件
+    if (pluginManager.getCurrentPluginPath() !== null) {
+      console.log('[Window] 检测到插件正在显示，先隐藏插件')
+      pluginManager.hidePluginView()
+      // 通知渲染进程返回搜索页面
+      this.notifyBackToSearch()
+    }
+
+    // 记录打开窗口前的激活窗口
+    const currentWindow = clipboardManager.getCurrentWindow()
+    if (currentWindow) {
+      this.previousActiveWindow = currentWindow
+      console.log('[Window] 记录打开前的激活窗口:', currentWindow.app)
+
+      // 发送窗口信息到渲染进程
+      this.mainWindow.webContents.send('window-info-changed', currentWindow)
+    }
+
+    // 从数据库查找设置插件
+    try {
+      const settingPlugin = this.findSettingPlugin()
+      if (!settingPlugin) return
+
+      console.log('[Window] 找到设置插件:', settingPlugin.path)
+
+      // 使用统一的 launch 方法启动设置插件
+      const result = await api.launchPlugin({
+        path: settingPlugin.path,
+        type: 'plugin',
+        featureCode: 'main',
+        name: '设置'
+      })
+
+      if (!result.success) {
+        console.error('[Window] 启动设置插件失败:', result.error)
+        return
+      }
+
+      // 智能定位：将窗口移动到鼠标所在的显示器（同步，从内存读取）
+      this.moveWindowToCursor()
+      // 使用强制激活逻辑显示窗口
+      this.forceActivateWindow()
+    } catch (error) {
+      console.error('[Window] 打开设置插件失败:', error)
+    }
+  }
+
+  /**
+   * 打开设置插件中的指定插件市场详情页。
+   * @param pluginName 需要展示详情的插件名称
+   * @returns 打开结果；无法启动设置插件时包含错误信息
+   */
+  public async showPluginMarketDetail(
+    pluginName: string
+  ): Promise<{ success: boolean; error?: string }> {
+    const normalizedName = pluginName.trim()
+    if (!this.mainWindow || !normalizedName) {
+      return { success: false, error: '无效的插件名称' }
+    }
+
+    // 切换到设置插件前释放当前插件视图，避免两个插件视图重叠。
+    if (pluginManager.getCurrentPluginPath() !== null) {
+      pluginManager.hidePluginView()
+      this.notifyBackToSearch()
+    }
+
+    try {
+      const settingPlugin = this.findSettingPlugin()
+      if (!settingPlugin) {
+        return { success: false, error: '未找到设置插件' }
+      }
+
+      // 复用设置插件现有的市场详情跳转事件协议。
+      const result = await api.launchPlugin({
+        path: settingPlugin.path,
+        type: 'plugin',
+        featureCode: 'function.plugin-market-search',
+        name: '插件市场',
+        cmdType: 'over',
+        param: {
+          code: 'function.plugin-market-search',
+          type: 'detail',
+          payload: normalizedName
+        }
+      })
+      if (!result.success) {
+        return { success: false, error: result.error || '打开插件市场失败' }
+      }
+
+      this.moveWindowToCursor()
+      this.forceActivateWindow()
+      return { success: true }
+    } catch (error: unknown) {
+      console.error('[Window] 打开插件市场详情失败:', error)
+      return {
+        success: false,
+        error: error instanceof Error ? error.message : '打开插件市场失败'
+      }
+    }
+  }
+
+  /**
+   * 从数据库查找 setting 插件
+   */
+  private findSettingPlugin(): any {
+    const plugins: any = api.dbGet('plugins')
+    if (!plugins || !Array.isArray(plugins)) {
+      console.error('[Window] 未找到插件列表')
+      return null
+    }
+    const settingPlugin = plugins.find((p: any) => p.name === 'setting')
+    if (!settingPlugin) {
+      console.error('[Window] 未找到设置插件')
+      return null
+    }
+    return settingPlugin
+  }
+
+  /**
+   * 打开插件安装页面（用于 .zpx 文件关联双击打开）
+   * 流程：激活应用 → 启动设置插件 → 导航到 PluginInstaller 页面 → 传入文件路径
+   * @param zpxPath .zpx 文件路径
+   */
+  public async openPluginInstaller(zpxPath: string): Promise<void> {
+    if (!this.mainWindow) return
+
+    console.log('[Window] 打开插件安装页面:', zpxPath)
+
+    // 临时抑制 blur 隐藏行为，防止窗口激活过程中被 blur 事件隐藏
+    this.suppressBlurHide = true
+
+    // macOS: 先显示 Dock 图标并激活应用，否则窗口无法获取焦点
+    if (platform.isMacOS) {
+      await app.dock?.show()
+      app.focus({ steal: true })
+    }
+
+    // 如果当前有插件在显示，先隐藏
+    if (pluginManager.getCurrentPluginPath() !== null) {
+      pluginManager.hidePluginView()
+      this.notifyBackToSearch()
+    }
+
+    try {
+      const settingPlugin = this.findSettingPlugin()
+      if (!settingPlugin) {
+        this.suppressBlurHide = false
+        return
+      }
+
+      // 启动设置插件，使用 install-plugin feature code
+      // payload 传入文件路径数组（与 "type": "files" cmd 格式一致）
+      const result = await api.launchPlugin({
+        path: settingPlugin.path,
+        type: 'plugin',
+        featureCode: 'function.install-plugin?router=PluginInstaller',
+        name: '安装插件',
+        cmdType: 'files',
+        param: {
+          code: 'function.install-plugin?router=PluginInstaller',
+          payload: [{ path: zpxPath }]
+        }
+      })
+
+      if (!result.success) {
+        console.error('[Window] 启动插件安装页面失败:', result.error)
+        this.suppressBlurHide = false
+        return
+      }
+
+      this.moveWindowToCursor()
+      if (platform.isMacOS) {
+        // 先重申 Spaces/层级（跳过进程类型变换），再显示并聚焦，避免面板落到桌面 Space。
+        // 本路径是插件安装页，需要 Dock 图标与常规窗口焦点，因此保留 app.focus({steal:true})。
+        // 不直接调用 forceActivateWindow：本路径已用外层手动 suppressBlurHide（500ms 释放）覆盖
+        // 激活期，forceActivateWindow 内部的瞬时抑制(200ms)会把它提前释放。
+        this.mainWindow.setVisibleOnAllWorkspaces(true, {
+          visibleOnFullScreen: true,
+          skipTransformProcessType: true
+        })
+        this.mainWindow.setAlwaysOnTop(true, 'modal-panel', 1)
+        app.focus({ steal: true })
+        this.mainWindow.show()
+        this.mainWindow.focus()
+      } else {
+        this.forceActivateWindow()
+      }
+
+      // 延迟恢复 blur 隐藏行为，确保窗口已稳定获取焦点
+      setTimeout(() => {
+        this.suppressBlurHide = false
+      }, 500)
+    } catch (error) {
+      console.error('[Window] 打开插件安装页面失败:', error)
+      this.suppressBlurHide = false
+    }
+  }
+
+  /**
+   * 从 input 事件构建快捷键字符串
+   */
+  private buildShortcutString(input: Electron.Input): string {
+    const keys: string[] = []
+
+    // 修饰键（按标准顺序）
+    if (input.meta) {
+      keys.push(platform.isMacOS ? 'Command' : 'Meta')
+    }
+    if (input.control) {
+      keys.push(platform.isMacOS ? 'Ctrl' : 'Ctrl')
+    }
+    if (input.alt) {
+      keys.push(platform.isMacOS ? 'Option' : 'Alt')
+    }
+    if (input.shift) {
+      keys.push('Shift')
+    }
+
+    // 主键（转换为标准格式）
+    const mainKey = this.normalizeKey(input.key)
+    if (mainKey && !WindowManager.MODIFIER_NAMES.includes(mainKey)) {
+      keys.push(mainKey)
+    }
+
+    return keys.join('+')
+  }
+
+  /**
+   * 标准化按键名称
+   */
+  private normalizeKey(key: string): string {
+    // 字母转大写
+    if (key.length === 1 && /[a-z]/.test(key)) {
+      return key.toUpperCase()
+    }
+
+    // 数字键
+    if (key.length === 1 && /[0-9]/.test(key)) {
+      return key
+    }
+
+    // 特殊键映射
+    const keyMap: Record<string, string> = {
+      ' ': 'Space',
+      Enter: 'Enter',
+      Escape: 'Escape',
+      Tab: 'Tab',
+      Backspace: 'Backspace',
+      Delete: 'Delete',
+      ArrowUp: 'Up',
+      ArrowDown: 'Down',
+      ArrowLeft: 'Left',
+      ArrowRight: 'Right',
+      Home: 'Home',
+      End: 'End',
+      PageUp: 'PageUp',
+      PageDown: 'PageDown'
+    }
+
+    return keyMap[key] || key
+  }
+
+  /**
+   * 处理应用快捷键触发
+   */
+  private async handleAppShortcut(target: string): Promise<void> {
+    try {
+      // 调用 API 管理器的全局快捷键处理方法
+      await api.handleGlobalShortcutTrigger(target, this.appShortcutLaunchContext)
+    } catch (error) {
+      console.error('[Window] 处理应用快捷键失败:', error)
+    }
+  }
+
+  /**
+   * 更新应用快捷键触发时要带给启动链路的输入上下文
+   */
+  public updateAppShortcutLaunchContext(context: Partial<AppShortcutLaunchContext>): void {
+    this.appShortcutLaunchContext = {
+      searchQuery: context.searchQuery ?? '',
+      pastedImage: context.pastedImage ?? null,
+      pastedFiles: context.pastedFiles ?? null,
+      pastedText: context.pastedText ?? null
+    }
+  }
+
+  /**
+   * 检查 Cmd+Q 内置快捷键（killPlugin）是否被用户禁用
+   * 用于 before-quit 事件：禁用时不隐藏窗口，让 Cmd+Q 可被用作呼出快捷键
+   */
+  public isKillPluginShortcutEnabled(): boolean {
+    try {
+      const settings = databaseAPI.dbGet('settings-general') || {}
+      return settings?.builtinAppShortcutsEnabled?.killPlugin !== false
+    } catch {
+      return true
+    }
+  }
+
+  /**
+   * 注册应用快捷键
+   */
+  public registerAppShortcut(shortcut: string, target: string): boolean {
+    try {
+      this.appShortcuts.set(shortcut, target)
+      console.log(`成功注册应用快捷键: ${shortcut} -> ${target}`)
+      return true
+    } catch (error) {
+      console.error('[Window] 注册应用快捷键失败:', error)
+      return false
+    }
+  }
+
+  /**
+   * 注销应用快捷键
+   */
+  public unregisterAppShortcut(shortcut: string): void {
+    this.appShortcuts.delete(shortcut)
+    console.log(`成功注销应用快捷键: ${shortcut}`)
+  }
+
+  /**
+   * 清空所有应用快捷键
+   */
+  public unregisterAllAppShortcuts(): void {
+    this.appShortcuts.clear()
+    console.log('[Window] 已清空所有应用快捷键')
+  }
+}
+
+// 导出单例
+export default new WindowManager()

@@ -1,0 +1,1382 @@
+import { ipcMain, shell } from 'electron'
+import { execFile } from 'child_process'
+import type { PluginManager } from '../../managers/pluginManager'
+import { promises as fs } from 'fs'
+import path from 'path'
+import { normalizeIconPath, toZToolsIconUrl } from '../../common/iconUtils'
+import { launchApp, type ConfirmDialogOptions } from '../../core/commandLauncher'
+import { scanApplications } from '../../core/commandScanner'
+import {
+  hasStaleUwpIconCache,
+  hasUwpPackageSnapshotChanged
+} from '../../core/commandScanner/uwpCache'
+import { UwpManager } from '../../core/native'
+import { pluginFeatureAPI } from '../plugin/feature'
+import databaseAPI from '../shared/database'
+import { WINDOWS_SETTINGS } from '../../core/systemSettings/windowsSettings.js'
+import { executeSystemCommand } from './systemCommands'
+import { findCommandIndex, filterOutCommand, hasCommand } from './commandMatchers'
+import { shouldKeepMainWindowHiddenForLaunch, type PluginLaunchSource } from '@shared/pluginLaunch'
+import type { CommandCatalog } from '../../../shared/commandService'
+
+/**
+ * 上次匹配状态接口
+ */
+interface LastMatchState {
+  searchQuery: string
+  pastedImage: string | null
+  pastedFiles: any[] | null
+  pastedText: string | null
+  timestamp: number
+}
+
+interface AppsCacheRefreshResult {
+  apps: any[]
+  cacheUpdated: boolean
+}
+
+interface UwpAppsScanResult {
+  apps: any[]
+  packageSnapshot?: string[]
+}
+
+/**
+ * 应用管理API - 主程序专用
+ */
+export class AppsAPI {
+  private catalogProvider?: () => Promise<CommandCatalog>
+  private catalogInvalidator?: () => void
+
+  /**
+   * 注入统一目录入口，保留设置页 getCommands 的兼容返回结构。
+   * @param provider 主进程统一目录提供器
+   * @param invalidate 目录来源变化回调
+   * @returns 无返回值
+   */
+  public setCatalogProvider(provider: () => Promise<CommandCatalog>, invalidate: () => void): void {
+    this.catalogProvider = provider
+    this.catalogInvalidator = invalidate
+  }
+  // v5: Windows Start Menu 整体递归、桌面仅扫描顶层，并废弃可能仅含 UWP 的旧缓存。
+  private static readonly APP_CACHE_VERSION = 5
+  private static readonly APP_CACHE_VERSION_KEY = 'cached-commands-version'
+  private static readonly UWP_PACKAGE_SNAPSHOT_KEY = 'cached-uwp-package-snapshot'
+  private mainWindow: Electron.BrowserWindow | null = null
+  private pluginManager: PluginManager | null = null
+  private launchParam: any = null
+  private pluginLaunchParams = new Map<string, any>()
+  private lastMatchState: LastMatchState | null = null
+  private isLocalAppSearchEnabled = true
+  private afterFirstAppsReadyCallback: (() => void) | null = null
+  private hasNotifiedFirstAppsReady = false
+  /** 由外部注入，用于在多屏场景下正确显示窗口（跟随光标所在屏幕） */
+  private showWindowCallback?: () => void
+
+  public setShowWindowCallback(callback: () => void): void {
+    this.showWindowCallback = callback
+  }
+
+  public setAfterFirstAppsReadyCallback(callback: () => void): void {
+    this.afterFirstAppsReadyCallback = callback
+  }
+
+  private notifyFirstAppsReady(): void {
+    if (this.hasNotifiedFirstAppsReady || !this.afterFirstAppsReadyCallback) {
+      return
+    }
+
+    this.hasNotifiedFirstAppsReady = true
+    const callback = this.afterFirstAppsReadyCallback
+    setTimeout(() => {
+      try {
+        callback()
+      } catch (error) {
+        console.error('[Commands] 首次应用列表就绪后的回调执行失败:', error)
+      }
+    }, 0)
+  }
+
+  /**
+   * 安全地向渲染进程发送消息
+   */
+  private notifyRenderer(channel: string, ...args: any[]): void {
+    if (this.mainWindow && !this.mainWindow.isDestroyed()) {
+      this.mainWindow.webContents.send(channel, ...args)
+    }
+  }
+
+  public init(mainWindow: Electron.BrowserWindow, pluginManager: PluginManager): void {
+    this.mainWindow = mainWindow
+    this.pluginManager = pluginManager
+    this.setupIPC()
+    this.loadLastMatchState()
+    // 异步加载本地应用搜索设置
+    this.loadLocalAppSearchSetting()
+  }
+
+  /**
+   * 返回目标插件的进入快照，兼容无路径的旧内部调用。
+   * @param pluginPath 目标插件路径
+   * @returns 启动参数副本
+   */
+  public getLaunchParam(pluginPath?: string): any {
+    return structuredClone(
+      pluginPath ? this.pluginLaunchParams.get(pluginPath) || {} : this.launchParam || {}
+    )
+  }
+
+  /**
+   * 通知统一服务重建目录，并按需刷新兼容页面。
+   * @param notifyRenderer 是否发送旧版应用列表通知
+   * @returns 无返回值
+   */
+  public invalidateCommandsCache(notifyRenderer = false): void {
+    this.catalogInvalidator?.()
+    console.log('[Commands] 指令缓存已清空:', { notifyRenderer })
+
+    if (notifyRenderer) {
+      console.log('[Commands] 发送 apps-changed 通知，触发主窗口重载指令与 alias 搜索索引')
+      this.notifyRenderer('apps-changed')
+    }
+  }
+
+  /**
+   * 根据名称查找直接启动指令（系统应用、系统设置等）
+   */
+  public async findDirectCommandByName(name: string): Promise<any | null> {
+    const { commands } = await this.getCommands()
+    return commands.find((cmd: any) => cmd.type === 'direct' && cmd.name === name) || null
+  }
+
+  private setupIPC(): void {
+    ipcMain.handle('get-apps', () => this.getApps())
+    ipcMain.handle('get-commands', () => this.getCommands())
+    ipcMain.handle('launch', (_event, options: any) => this.launch(options))
+    ipcMain.handle('launch-as-admin', (_event, appPath: string, name?: string) =>
+      this.launchAsAdmin(appPath, name)
+    )
+    ipcMain.handle('refresh-apps-cache', () => this.refreshAppsCache())
+
+    // 历史记录管理
+    ipcMain.handle(
+      'remove-from-history',
+      (_event, appPath: string, featureCode?: string, name?: string) =>
+        this.removeFromHistory(appPath, featureCode, name)
+    )
+
+    // 固定应用管理
+    ipcMain.handle('pin-app', (_event, app: any) => this.pinApp(app))
+    ipcMain.handle('unpin-app', (_event, appPath: string, featureCode?: string, name?: string) =>
+      this.unpinApp(appPath, featureCode, name)
+    )
+    ipcMain.handle('update-pinned-order', (_event, newOrder: any[]) =>
+      this.updatePinnedOrder(newOrder)
+    )
+
+    // 上次匹配状态管理
+    ipcMain.handle('get-last-match-state', () => this.getLastMatchState())
+    ipcMain.handle('restore-last-match', () => this.restoreLastMatch())
+
+    // 使用统计管理
+    ipcMain.handle('get-usage-stats', () => this.getUsageStats())
+  }
+
+  /**
+   * 设置本地应用搜索开启状态
+   */
+  public setLocalAppSearch(enabled: boolean): void {
+    this.isLocalAppSearchEnabled = enabled
+    this.invalidateCommandsCache(true)
+    console.log('[Commands] 本地应用搜索已' + (enabled ? '开启' : '关闭'))
+  }
+
+  /**
+   * 加载本地应用搜索设置
+   */
+  private loadLocalAppSearchSetting(): void {
+    try {
+      const data = databaseAPI.dbGet('settings-general')
+      if (data && typeof data.localAppSearch === 'boolean') {
+        this.isLocalAppSearchEnabled = data.localAppSearch
+      }
+      console.log('[Commands] 加载本地应用搜索设置:', this.isLocalAppSearchEnabled)
+    } catch (error) {
+      console.error('[Commands] 加载本地应用搜索设置失败:', error)
+    }
+  }
+
+  /**
+   * 获取使用统计
+   */
+  private getUsageStats(): any[] {
+    try {
+      const stats = databaseAPI.dbGet('command-usage-stats')
+      return stats || []
+    } catch (error) {
+      console.error('[Commands] 获取使用统计失败:', error)
+      return []
+    }
+  }
+
+  /**
+   * 获取系统应用列表，并处理图标缓存
+   * 优先从数据库缓存读取，没有缓存时才扫描
+   *
+   * @returns 系统应用列表；有效缓存存在时直接返回缓存。
+   */
+  public async getApps(): Promise<any[]> {
+    console.log('[Commands] 收到获取应用列表请求')
+
+    // 如果本地应用搜索被禁用，直接返回空列表
+    if (!this.isLocalAppSearchEnabled) {
+      console.log('[Commands] 本地应用搜索已关闭，返回空列表')
+      return []
+    }
+
+    let currentUwpPackageSnapshot: string[] | undefined
+
+    // 尝试从数据库缓存读取
+    try {
+      const cachedApps = databaseAPI.dbGet('cached-commands')
+      const cacheVersion = databaseAPI.dbGet(AppsAPI.APP_CACHE_VERSION_KEY)
+      if (cachedApps && Array.isArray(cachedApps) && cachedApps.length > 0) {
+        // 检查缓存的图标格式是否为新协议
+        // 只要有一个应用使用了旧的文件路径格式（且不是 .png 结尾的静态资源），就视为旧缓存
+        const hasOldFormat = cachedApps.some(
+          (app) =>
+            app.icon &&
+            !app.icon.startsWith('ztools-icon://') &&
+            !app.icon.startsWith('data:') &&
+            !app.icon.startsWith('http') &&
+            // Windows 上的静态 png 资源除外（通常是手动转换的）
+            !(
+              process.platform === 'win32' &&
+              app.icon.startsWith('file:') &&
+              app.icon.endsWith('.png')
+            )
+        )
+        const hasStaleUwpIcons = process.platform === 'win32' && hasStaleUwpIconCache(cachedApps)
+        let hasUwpPackageChanges = false
+        if (process.platform === 'win32') {
+          try {
+            // 轻量比较包注册快照，补偿 ZTools 未运行期间错过的安装、更新和卸载事件。
+            currentUwpPackageSnapshot = UwpManager.getPackageSnapshot()
+            const cachedUwpPackageSnapshot = databaseAPI.dbGet(AppsAPI.UWP_PACKAGE_SNAPSHOT_KEY)
+            hasUwpPackageChanges = hasUwpPackageSnapshotChanged(
+              cachedUwpPackageSnapshot,
+              currentUwpPackageSnapshot
+            )
+          } catch (error) {
+            // 快照不可用时继续使用图标路径校验，不阻断应用列表加载。
+            console.error('[Commands] 校验 UWP 包注册快照失败:', error)
+          }
+        }
+
+        if (cacheVersion !== AppsAPI.APP_CACHE_VERSION) {
+          console.log('[Commands] 检测到旧版应用缓存，将重新扫描以刷新本地化名称索引...')
+        } else if (hasOldFormat) {
+          console.log('[Commands] 检测到旧格式图标缓存，将重新扫描并更新为 ztools-icon 协议...')
+        } else if (hasStaleUwpIcons || hasUwpPackageChanges) {
+          try {
+            // Win32 缓存仍然有效时只替换 UWP 条目，避免包变化触发快捷方式全量扫描。
+            const reason = hasStaleUwpIcons ? '失效的 UWP 图标缓存' : 'UWP 包注册变化'
+            console.log(`[Commands] 检测到${reason}，仅刷新 UWP 应用...`)
+            const apps = this.replaceCachedUwpApps(cachedApps, currentUwpPackageSnapshot)
+            this.notifyFirstAppsReady()
+            return apps
+          } catch (error) {
+            // UWP 刷新失败时继续使用旧缓存，下次启动或包事件会再次尝试。
+            console.error('[Commands] 刷新启动阶段 UWP 应用失败，继续使用旧缓存:', error)
+            this.notifyFirstAppsReady()
+            return cachedApps
+          }
+        } else {
+          console.log(`从缓存读取到 ${cachedApps.length} 个应用`)
+          this.notifyFirstAppsReady()
+          return cachedApps
+        }
+      }
+    } catch (error) {
+      console.log('[Commands] 读取应用缓存失败，将进行扫描:', error)
+    }
+
+    // 缓存缺失、版本过旧或图标格式失效时执行一次修复性扫描。
+    console.log('[Commands] 应用缓存不可用，开始扫描应用...')
+    const { apps } = await this.scanAndCacheApps(currentUwpPackageSnapshot)
+    this.notifyFirstAppsReady()
+    return apps
+  }
+
+  /**
+   * 扫描当前用户的 UWP 应用并生成缓存命令。
+   *
+   * @param knownUwpPackageSnapshot 调用方已经读取的包注册快照。
+   * @returns UWP 命令和可用的包注册快照。
+   * @throws UWP 应用枚举失败时抛出。
+   */
+  private scanUwpApps(knownUwpPackageSnapshot?: string[]): UwpAppsScanResult {
+    const uwpApps = UwpManager.getUwpApps()
+    const apps: any[] = []
+    const seenPaths = new Set<string>()
+
+    // 同一包可能暴露重复注册项，按稳定的 AppUserModelID 去重。
+    for (const uwpApp of uwpApps) {
+      const uwpPath = `uwp:${uwpApp.appId}`
+      const normalizedPath = uwpPath.toLowerCase()
+      if (seenPaths.has(normalizedPath)) continue
+      seenPaths.add(normalizedPath)
+      apps.push({
+        name: uwpApp.name,
+        path: uwpPath,
+        icon: toZToolsIconUrl(uwpApp.icon)
+      })
+    }
+
+    let packageSnapshot = knownUwpPackageSnapshot
+    if (!packageSnapshot) {
+      try {
+        // 快照失败不影响本次 UWP 列表使用，但不持久化快照以便后续重试。
+        packageSnapshot = UwpManager.getPackageSnapshot()
+      } catch (error) {
+        console.error('[Commands] 保存 UWP 包注册快照失败:', error)
+      }
+    }
+
+    console.log(`获取到 ${uwpApps.length} 个 UWP 应用，去重后 ${apps.length} 个`)
+    return { apps, packageSnapshot }
+  }
+
+  /**
+   * 使用最新 UWP 条目替换缓存中的旧 UWP 条目并持久化。
+   *
+   * @param cachedApps 已确认版本有效的应用缓存。
+   * @param knownUwpPackageSnapshot 调用方已经读取的包注册快照。
+   * @returns 替换 UWP 条目后的完整应用列表。
+   * @throws UWP 枚举或数据库写入失败时抛出。
+   */
+  private replaceCachedUwpApps(cachedApps: any[], knownUwpPackageSnapshot?: string[]): any[] {
+    const uwpScan = this.scanUwpApps(knownUwpPackageSnapshot)
+
+    // 保留全部非 UWP 命令，只替换 path 带 uwp: 前缀的缓存条目。
+    const apps = [
+      ...cachedApps.filter(
+        (app) => typeof app?.path !== 'string' || !app.path.toLowerCase().startsWith('uwp:')
+      ),
+      ...uwpScan.apps
+    ]
+    databaseAPI.dbPut('cached-commands', apps)
+    if (uwpScan.packageSnapshot) {
+      databaseAPI.dbPut(AppsAPI.UWP_PACKAGE_SNAPSHOT_KEY, uwpScan.packageSnapshot)
+    }
+    console.log(`[Commands] UWP 应用缓存已独立刷新，共 ${apps.length} 个应用`)
+    return apps
+  }
+
+  /**
+   * 扫描应用并缓存到数据库
+   *
+   * @param knownUwpPackageSnapshot 启动校验阶段已经读取的 UWP 包快照。
+   * @returns 扫描结果和持久化缓存是否发生更新。
+   */
+  private async scanAndCacheApps(
+    knownUwpPackageSnapshot?: string[]
+  ): Promise<AppsCacheRefreshResult> {
+    let fallbackApps: any[] = []
+    try {
+      // 扫描失败时保留进入本次刷新前的最后一份完整缓存。
+      const cachedApps = databaseAPI.dbGet('cached-commands')
+      if (Array.isArray(cachedApps)) fallbackApps = cachedApps
+    } catch (error) {
+      console.error('[Commands] 读取扫描失败回退缓存失败:', error)
+    }
+
+    const scanResult = await scanApplications()
+    const apps = [...scanResult.apps]
+    console.log(`扫描到 ${apps.length} 个本地应用`)
+
+    if (!scanResult.complete) {
+      console.error('[Commands] 本地应用扫描不完整，不覆盖现有缓存:', scanResult.errors)
+      if (fallbackApps.length > 0) {
+        return { apps: fallbackApps, cacheUpdated: false }
+      }
+
+      // 首次启动没有旧缓存时允许临时展示成功来源，但保持数据库为空以便下次重试。
+      if (process.platform === 'win32') {
+        try {
+          const uwpScan = this.scanUwpApps(knownUwpPackageSnapshot)
+          apps.push(...uwpScan.apps)
+        } catch (error) {
+          console.error('[Commands] 部分扫描后获取 UWP 应用失败:', error)
+        }
+      }
+      return { apps, cacheUpdated: false }
+    }
+
+    let uwpPackageSnapshot = knownUwpPackageSnapshot
+    let uwpScanSucceeded = false
+
+    // Windows 平台：获取 UWP 应用并合并
+    if (process.platform === 'win32') {
+      try {
+        const uwpScan = this.scanUwpApps(knownUwpPackageSnapshot)
+        apps.push(...uwpScan.apps)
+        uwpPackageSnapshot = uwpScan.packageSnapshot
+        console.log(`合并 UWP 后共 ${apps.length} 个应用`)
+        uwpScanSucceeded = true
+      } catch (error) {
+        console.error('[Commands] 获取 UWP 应用失败:', error)
+
+        // 新的 Win32 扫描仍可落盘，同时保留上一份 UWP 条目避免暂时消失。
+        apps.push(
+          ...fallbackApps.filter(
+            (app) => typeof app?.path === 'string' && app.path.toLowerCase().startsWith('uwp:')
+          )
+        )
+      }
+    }
+
+    // 注意：windowsScanner 已经在扫描时生成了 ztools-icon:// 协议 URL
+    // 不需要再进行图标提取或文件转换，直接使用扫描结果即可
+
+    // 保存到数据库缓存
+    try {
+      databaseAPI.dbPut('cached-commands', apps)
+      databaseAPI.dbPut(AppsAPI.APP_CACHE_VERSION_KEY, AppsAPI.APP_CACHE_VERSION)
+      if (process.platform === 'win32' && uwpScanSucceeded && uwpPackageSnapshot) {
+        databaseAPI.dbPut(AppsAPI.UWP_PACKAGE_SNAPSHOT_KEY, uwpPackageSnapshot)
+      }
+      console.log('[Commands] 应用列表已缓存到数据库')
+      return { apps, cacheUpdated: true }
+    } catch (error) {
+      console.error('[Commands] 缓存应用列表失败:', error)
+      return { apps, cacheUpdated: false }
+    }
+  }
+
+  /**
+   * 刷新应用缓存（当检测到应用文件夹变化时调用）
+   */
+  public async refreshAppsCache(): Promise<void> {
+    if (!this.isLocalAppSearchEnabled) {
+      console.log('[Commands] 本地应用搜索已关闭，跳过刷新缓存')
+      return
+    }
+
+    console.log('[Commands] 开始刷新应用缓存...')
+    try {
+      const result = await this.scanAndCacheApps()
+      if (result.cacheUpdated) {
+        this.invalidateCommandsCache(true)
+        console.log('[Commands] 应用缓存刷新成功')
+      } else {
+        console.warn('[Commands] 应用扫描不完整，已保留原缓存')
+      }
+    } catch (error) {
+      console.error('[Commands] 刷新应用缓存失败:', error)
+    }
+  }
+
+  /**
+   * 仅刷新持久化缓存中的 UWP 应用，避免包事件触发 Win32 快捷方式扫描。
+   *
+   * @returns 刷新完成后的 Promise；缓存不可用或刷新失败时保留原缓存。
+   */
+  public async refreshUwpAppsCache(): Promise<void> {
+    if (process.platform !== 'win32' || !this.isLocalAppSearchEnabled) return
+
+    try {
+      const cachedApps = databaseAPI.dbGet('cached-commands')
+      const cacheVersion = databaseAPI.dbGet(AppsAPI.APP_CACHE_VERSION_KEY)
+      if (!Array.isArray(cachedApps) || cachedApps.length === 0) {
+        console.log('[Commands] 尚无完整应用缓存，跳过独立 UWP 刷新并等待首次扫描')
+        return
+      }
+      if (cacheVersion !== AppsAPI.APP_CACHE_VERSION) {
+        console.log('[Commands] 应用缓存版本过旧，跳过独立 UWP 刷新并等待修复性扫描')
+        return
+      }
+
+      this.replaceCachedUwpApps(cachedApps)
+      this.invalidateCommandsCache(true)
+    } catch (error) {
+      // 保持旧快照或旧缓存版本，让下一次事件或启动校验继续重试。
+      console.error('[Commands] 独立刷新 UWP 应用失败，将在后续重试:', error)
+    }
+  }
+
+  /**
+   * 在 PackageCatalog 订阅建立后复核包快照，关闭启动扫描与事件监听之间的竞态窗口。
+   *
+   * @returns 检查及必要刷新完成后的 Promise。
+   */
+  public async refreshAppsCacheIfUwpPackagesChanged(): Promise<void> {
+    if (process.platform !== 'win32' || !this.isLocalAppSearchEnabled) return
+
+    try {
+      // 仅枚举包完整名；没有变化时不执行应用和图标全量扫描。
+      const cachedSnapshot = databaseAPI.dbGet(AppsAPI.UWP_PACKAGE_SNAPSHOT_KEY)
+      const currentSnapshot = UwpManager.getPackageSnapshot()
+      if (hasUwpPackageSnapshotChanged(cachedSnapshot, currentSnapshot)) {
+        console.log('[Commands] PackageCatalog 建立后检测到包注册变化，开始补偿刷新...')
+        await this.refreshUwpAppsCache()
+      }
+    } catch (error) {
+      // 复核失败不影响实时监听和下次启动校验。
+      console.error('[Commands] PackageCatalog 建立后的包快照复核失败:', error)
+    }
+  }
+
+  /**
+   * 编排插件启动，在唤起主窗口前统一确定搜索状态和进入行为，并处理自动分离。
+   * @param options 插件路径、功能代码、显示名称和启动来源。
+   * @param pluginConfig 已读取的插件配置。
+   * @returns 插件启动结果。
+   * @throws 插件视图创建或独立窗口启动失败时抛出错误。
+   */
+  private async preparePluginLaunch(
+    options: {
+      path: string
+      featureCode: string
+      name?: string
+      launchSource?: PluginLaunchSource
+      param?: any
+    },
+    pluginConfig: any
+  ): Promise<{ success: boolean; error?: string }> {
+    if (!this.pluginManager) {
+      return { success: false, error: 'Plugin Manager 未初始化' }
+    }
+    const { path: appPath, featureCode, name, launchSource, param } = options
+    const plugin = this.getPluginsFromDB().find((p: any) => p.path === appPath)
+    const effectiveName = plugin?.name
+    // 检查是否配置为自动分离
+    let shouldAutoDetach = false
+    if (pluginConfig && effectiveName) {
+      try {
+        const autoDetachPlugins: string[] = databaseAPI.dbGet('auto-detach-plugin') || []
+        if (Array.isArray(autoDetachPlugins) && autoDetachPlugins.includes(effectiveName)) {
+          shouldAutoDetach = true
+          console.log(`插件 ${effectiveName} 配置为自动分离，直接在独立窗口中创建`)
+        }
+      } catch (error) {
+        console.error('[Commands] 检查自动分离配置失败:', error)
+      }
+    }
+
+    // 先预检查目标插件是否已在分离窗口中运行。
+    // 这里必须发生在主窗口 show / placeholder 之前，否则“只是聚焦已有分离窗口”的场景也会把主窗口 UI 弄脏。
+    const reusedDetached = await this.pluginManager.reuseDetachedSingletonIfExists(
+      appPath,
+      featureCode,
+      'launch-precheck',
+      param
+    )
+
+    if (reusedDetached) {
+      console.log('[Commands] 目标插件已在分离窗口运行，跳过主窗口占位态:', {
+        path: appPath,
+        featureCode
+      })
+      return { success: true }
+    }
+
+    if (shouldAutoDetach) {
+      const result = await this.pluginManager.createPluginInDetachedWindow(
+        appPath,
+        featureCode,
+        param
+      )
+
+      if (!result.success) {
+        console.error('[Commands] 在独立窗口中创建插件失败:', result.error)
+        // 降级时也使用同一启动快照，避免顶部栏清空与插件跳过进入不一致。
+        const launchState = this.pluginManager.getMainWindowLaunchState(appPath, featureCode, param)
+        this.notifyRenderer('show-plugin-placeholder', launchState)
+        await this.pluginManager.createPluginView(
+          appPath,
+          featureCode,
+          name,
+          param,
+          launchState.mode
+        )
+      } else {
+        // 创建成功，隐藏主窗口
+        this.mainWindow?.hide()
+      }
+    } else {
+      // 在 show() 改变可见性前固定进入行为，并先切换宿主模式，避免 focus-search 重置插件。
+      const launchState = this.pluginManager.getMainWindowLaunchState(appPath, featureCode, param)
+      this.notifyRenderer('show-plugin-placeholder', launchState)
+
+      // 全局快捷键和超级面板触发 mainHide feature 时，保持主窗口隐藏，避免先显示搜索窗口再收起插件区域。
+      const shouldKeepMainWindowHidden = shouldKeepMainWindowHiddenForLaunch(
+        launchSource,
+        this.pluginManager.shouldKeepMainWindowHidden(appPath, featureCode)
+      )
+
+      // 检查主窗口是否可见
+      if (!shouldKeepMainWindowHidden && !this.mainWindow?.isVisible()) {
+        // 使用注入的回调（会跟随光标所在屏幕），降级到直接 show()
+        if (this.showWindowCallback) {
+          this.showWindowCallback()
+        } else {
+          this.mainWindow?.show()
+        }
+      }
+
+      // 在主窗口中创建插件
+      await this.pluginManager.createPluginView(appPath, featureCode, name, param, launchState.mode)
+    }
+
+    return { success: true }
+  }
+
+  /**
+   * 启动应用或插件（统一接口）。
+   * @param options 启动目标及可选的插件功能、参数和启动来源。
+   * @returns 启动结果或底层启动器返回值。
+   * @throws 底层应用或插件启动失败时抛出错误。
+   */
+  public async launch(options: {
+    path: string
+    type?: 'direct' | 'plugin' | 'builtin' | 'file'
+    featureCode?: string
+    param?: any
+    name?: string // cmd 名称（用于历史记录显示）
+    cmdType?: string // cmd 类型（用于判断是否添加历史记录）
+    confirmDialog?: ConfirmDialogOptions // 确认对话框配置
+    launchSource?: PluginLaunchSource
+  }): Promise<any> {
+    const { path: appPath, type, name, cmdType, confirmDialog, launchSource } = options
+    const param = structuredClone(options.param || {})
+    let { featureCode } = options
+    this.launchParam = param || {}
+
+    try {
+      // 判断是插件还是直接启动
+      if (type === 'plugin') {
+        const disabled = databaseAPI.dbGet('disabled-plugins')
+        const plugin = this.getPluginsFromDB().find((item) => item.path === appPath)
+        // 执行时读取最新稳定标识，设置变更不能被旧路径缓存覆盖。
+        if (
+          Array.isArray(disabled) &&
+          (disabled.includes(appPath) || disabled.includes(plugin?.name))
+        ) {
+          return { success: false, error: '插件已禁用' }
+        }
+        // 如果没有传 featureCode，自动查找第一个非匹配 feature
+        if (!featureCode) {
+          const result = await this.getDefaultFeatureCode(appPath)
+          if (!result.success) {
+            // 返回错误给前端
+            return { success: false, error: result.error }
+          }
+          featureCode = result.featureCode
+        }
+
+        // 插件启动参数中添加 featureCode
+        param.code = featureCode || ''
+        this.launchParam = param
+        this.pluginLaunchParams.set(appPath, structuredClone(param))
+
+        console.log('[Commands] 启动插件:', {
+          path: appPath,
+          featureCode,
+          name,
+          launchParam: this.launchParam
+        })
+
+        // 读取 plugin.json（一次性读取，后续复用）
+        let pluginConfig: any = null
+        try {
+          const pluginJsonPath = path.join(appPath, 'plugin.json')
+          pluginConfig = JSON.parse(await fs.readFile(pluginJsonPath, 'utf-8'))
+        } catch (error) {
+          console.error('[Commands] 读取 plugin.json 失败:', error)
+        }
+
+        // 检查是否为 system 插件（特殊处理：执行系统命令而不是创建视图）
+        if (pluginConfig?.name === 'system') {
+          console.log('[Commands] 检测到 system 插件，执行系统命令:', featureCode)
+          const result = await executeSystemCommand(
+            featureCode || '',
+            {
+              mainWindow: this.mainWindow,
+              pluginManager: this.pluginManager
+            },
+            param
+          )
+          if (result?.success !== false)
+            await this.recordSuccessfulPluginLaunch(
+              appPath,
+              featureCode || '',
+              name,
+              cmdType,
+              param
+            )
+          return result
+        }
+        const result = await this.preparePluginLaunch(
+          {
+            path: appPath,
+            featureCode: featureCode || '',
+            name,
+            launchSource,
+            param
+          },
+          pluginConfig
+        )
+        if (result.success)
+          await this.recordSuccessfulPluginLaunch(appPath, featureCode || '', name, cmdType, param)
+        return result
+      } else if (type === 'file') {
+        // 文件/文件夹类型：在文件管理器中定位
+        console.log('[Commands] 在文件管理器中定位:', appPath)
+        shell.showItemInFolder(appPath)
+
+        // 添加到历史记录
+        await this.addToHistory({ path: appPath, type: 'file', name, cmdType: 'text' })
+
+        // 隐藏当前插件视图（如果有）
+        this.pluginManager?.hidePluginView()
+        // 通知渲染进程应用已启动（清空搜索框等）
+        this.notifyRenderer('app-launched')
+        this.mainWindow?.hide()
+      } else {
+        // 直接启动（app / system-setting / local-shortcut / UWP / 协议链接）
+        // 本地应用走统一启动器，文件和文件夹继续使用 shell.openPath。
+        const localShortcuts = databaseAPI.dbGet('local-shortcuts')
+        const localShortcut = Array.isArray(localShortcuts)
+          ? localShortcuts.find((shortcut: any) => shortcut.path === appPath)
+          : undefined
+
+        if (localShortcut && !(process.platform === 'win32' && localShortcut.type === 'app')) {
+          const result = await shell.openPath(appPath)
+          if (result) {
+            console.error('[Commands] 打开本地启动项失败:', result)
+            throw new Error(`打开失败: ${result}`)
+          }
+        } else {
+          // 统一走 launchApp（内部处理 uwp: / 协议链接 / 普通应用等）
+          await launchApp(appPath, confirmDialog)
+        }
+
+        // 添加到历史记录
+        await this.addToHistory({ path: appPath, type: type || 'app', name, cmdType: 'text' })
+        this.updateUsageStats({ path: appPath, type: 'app', name })
+
+        // 隐藏当前插件视图（如果有）
+        this.pluginManager?.hidePluginView()
+        // 通知渲染进程应用已启动（清空搜索框等）
+        this.notifyRenderer('app-launched')
+        this.mainWindow?.hide()
+      }
+    } catch (error) {
+      console.error('[Commands] 启动失败:', error)
+      throw error
+    }
+  }
+
+  /**
+   * 以管理员身份启动应用（仅 Windows）
+   */
+  private launchAsAdmin(appPath: string, name?: string): void {
+    if (process.platform !== 'win32') {
+      throw new Error('仅支持 Windows 平台')
+    }
+
+    try {
+      const escapedPath = appPath.replace(/'/g, "''")
+      let psCommand: string
+
+      if (appPath.toLowerCase().endsWith('.lnk')) {
+        // .lnk 快捷方式：先解析目标路径，再对目标可执行文件进行提权启动
+        // 注意：$args 是 PowerShell 保留变量，必须用其他变量名
+        psCommand = [
+          `$lnk = (New-Object -ComObject WScript.Shell).CreateShortcut('${escapedPath}');`,
+          `$sp = @{ FilePath = $lnk.TargetPath; Verb = 'RunAs' };`,
+          `if ($lnk.Arguments) { $sp.ArgumentList = $lnk.Arguments };`,
+          `Start-Process @sp`
+        ].join(' ')
+      } else {
+        // 非 .lnk 文件：直接提权启动
+        psCommand = `Start-Process -FilePath '${escapedPath}' -Verb RunAs`
+      }
+
+      console.log(`[Commands] 以管理员身份启动: ${appPath}`)
+      console.log(`[Commands] PowerShell 命令: ${psCommand}`)
+
+      execFile(
+        'powershell.exe',
+        ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', psCommand],
+        (error, _stdout, stderr) => {
+          if (error) {
+            console.error('[Commands] 管理员启动失败:', error.message)
+          }
+          if (stderr) {
+            console.error('[Commands] 管理员启动 stderr:', stderr)
+          }
+        }
+      )
+
+      console.log(`[Commands] 以管理员身份启动: ${appPath}`)
+
+      // 添加到历史记录
+      this.addToHistory({ path: appPath, type: 'direct', name, cmdType: 'text' })
+
+      // 隐藏当前插件视图（如果有）
+      this.pluginManager?.hidePluginView()
+      // 通知渲染进程应用已启动
+      this.notifyRenderer('app-launched')
+      this.mainWindow?.hide()
+    } catch (error) {
+      console.error('[Commands] 管理员启动失败:', error)
+      throw error
+    }
+  }
+
+  /**
+   * 添加到历史记录
+   */
+  private async addToHistory(options: {
+    path: string
+    type?: 'app' | 'direct' | 'plugin' | 'builtin' | 'file'
+    featureCode?: string
+    param?: any
+    name?: string // cmd 名称（用于历史记录显示）
+    cmdType?: string // cmd 类型（用于判断是否添加历史记录）
+  }): Promise<void> {
+    try {
+      const { path: appPath, type = 'app', featureCode, name: cmdName, cmdType } = options
+
+      console.log('[Commands] 添加指令到历史记录:', cmdName, '类型:', cmdType || 'text')
+
+      const now = Date.now()
+
+      // 获取应用/插件信息
+      let appInfo: any = null
+
+      // 特殊指令和内置指令不需要查找应用信息，前端会处理显示
+      if (appPath.startsWith('special:') || appPath.startsWith('builtin:')) {
+        // 尝试从缓存的应用列表中获取完整信息（包括图标）
+        const cachedApps = databaseAPI.dbGet('cached-commands')
+        const cachedBuiltin = cachedApps?.find((a: any) => a.path === appPath)
+
+        appInfo = {
+          name: cmdName || appPath,
+          path: appPath,
+          icon: cachedBuiltin?.icon, // 从缓存中获取图标
+          type: 'builtin',
+          cmdType: cmdType || 'text'
+        }
+      } else if (type === 'plugin') {
+        // 从插件列表中查找
+        const dbPlugins = this.getPluginsFromDB()
+
+        // 先从运行中的插件查找
+        const plugin = dbPlugins.find((p: any) => p.path === appPath)
+
+        if (plugin) {
+          // 读取插件配置获取完整信息
+          const pluginJsonPath = path.join(appPath, 'plugin.json')
+          try {
+            const pluginConfig = JSON.parse(await fs.readFile(pluginJsonPath, 'utf-8'))
+
+            // 查找对应的 feature（从 plugin.json）
+            let feature = pluginConfig.features?.find((f: any) => f.code === featureCode)
+
+            // 如果在 plugin.json 中没找到，尝试从动态 features 中查找
+            if (!feature) {
+              const dynamicFeatures = pluginFeatureAPI.loadDynamicFeatures(plugin.name)
+              feature = dynamicFeatures.find((f: any) => f.code === featureCode)
+            }
+
+            // 优先使用 feature 的 icon，如果没有则使用 plugin 的 logo
+            let featureIcon = feature?.icon || plugin.logo || ''
+
+            // 标准化 icon 路径（处理相对路径、base64、http等）
+            if (featureIcon) {
+              featureIcon = normalizeIconPath(featureIcon, appPath)
+            }
+
+            appInfo = {
+              name: cmdName || pluginConfig.name, // 优先使用传入的 cmd 名称
+              path: appPath,
+              icon: featureIcon,
+              type: 'plugin',
+              featureCode: featureCode,
+              pluginName: plugin.name, // 有效名（开发版含 __dev 后缀）
+              pluginExplain: feature?.explain || '',
+              cmdType: cmdType || 'text'
+            }
+          } catch (error) {
+            console.error('[Commands] 读取插件配置失败:', error)
+            return
+          }
+        }
+      } else {
+        // 从系统应用列表中查找
+        const cachedApps = databaseAPI.dbGet('cached-commands')
+        const app = cachedApps?.find((a: any) => a.path === appPath)
+
+        if (app) {
+          appInfo = {
+            name: cmdName || app.name, // 优先使用传入的 cmd 名称
+            originalName: app.name,
+            path: app.path,
+            icon: app.icon,
+            pinyin: app.pinyin,
+            pinyinAbbr: app.pinyinAbbr,
+            type: 'direct',
+            subType: 'app',
+            cmdType: cmdType || 'text'
+          }
+        } else {
+          // 如果不是普通应用，尝试从系统设置中查找
+          if (process.platform === 'win32') {
+            const setting = WINDOWS_SETTINGS.find((s: any) => s.uri === appPath)
+
+            if (setting) {
+              appInfo = {
+                name: cmdName || setting.name,
+                path: setting.uri,
+                icon: setting.icon,
+                type: 'system-setting',
+                category: setting.category
+              }
+            }
+          }
+        }
+
+        // 如果仍未找到，尝试从本地启动项中查找
+        if (!appInfo) {
+          const localShortcuts = databaseAPI.dbGet('local-shortcuts')
+          const shortcut = localShortcuts?.find((s: any) => s.path === appPath)
+          if (shortcut) {
+            appInfo = {
+              name: cmdName || shortcut.alias || shortcut.name,
+              path: shortcut.path,
+              icon: shortcut.icon || '',
+              type: 'direct',
+              subType: 'local-shortcut',
+              pinyin: shortcut.pinyin || '',
+              pinyinAbbr: shortcut.pinyinAbbr || ''
+            }
+          }
+        }
+      }
+
+      if (!appInfo) {
+        console.warn('[Commands] 未找到应用信息，跳过添加历史记录:', appPath)
+        return
+      }
+
+      // 读取历史记录
+      const history: any[] = databaseAPI.dbGet('command-history') || []
+
+      // 查找是否已存在（非插件类型需要同时匹配 name 和 path，支持同路径不同名应用）
+      const historyMatchType =
+        appInfo.type === 'direct' && appInfo.subType === 'app' ? 'app' : appInfo.type
+      const existingIndex = findCommandIndex(
+        history,
+        appPath,
+        historyMatchType,
+        featureCode,
+        appInfo.pluginName || appInfo.name
+      )
+
+      if (existingIndex >= 0) {
+        // 已存在，更新使用时间和次数
+        history[existingIndex].lastUsed = now
+        history[existingIndex].useCount = (history[existingIndex].useCount || 0) + 1
+        // 更新可能变化的信息（包括 path，确保开发/生产模式切换后路径同步）
+        history[existingIndex].path = appInfo.path
+        history[existingIndex].name = appInfo.name
+        history[existingIndex].icon = appInfo.icon
+        history[existingIndex].type = appInfo.type
+        history[existingIndex].subType = appInfo.subType
+        history[existingIndex].cmdType = appInfo.cmdType
+        history[existingIndex].pluginName = appInfo.pluginName
+        history[existingIndex].pluginExplain = appInfo.pluginExplain
+        history[existingIndex].originalName = appInfo.originalName
+      } else {
+        // 新记录
+        history.push({
+          ...appInfo,
+          lastUsed: now,
+          useCount: 1
+        })
+      }
+
+      // 按最近使用时间排序
+      history.sort((a, b) => b.lastUsed - a.lastUsed)
+
+      // 保存历史记录
+      databaseAPI.dbPut('command-history', history)
+
+      console.log('[Commands] 历史记录已更新:', appInfo.name)
+
+      // 通知前端重新加载历史记录
+      this.notifyRenderer('history-changed')
+    } catch (error) {
+      console.error('[Commands] 添加历史记录失败:', error)
+    }
+  }
+
+  /**
+   * 更新指令使用统计（独立于历史记录，用于匹配推荐排序）
+   */
+  private updateUsageStats(options: {
+    path: string
+    type?: 'app' | 'plugin'
+    featureCode?: string
+    name?: string
+  }): void {
+    try {
+      const { path: cmdPath, type = 'app', featureCode, name: cmdName } = options
+
+      console.log('[Commands] 更新指令使用统计:', cmdName || cmdPath)
+
+      const now = Date.now()
+
+      // 读取使用统计
+      const stats: any[] = databaseAPI.dbGet('command-usage-stats') || []
+
+      // 查找是否已存在（非插件类型需要同时匹配 name 和 path，支持同路径不同名应用）
+      const existingIndex = findCommandIndex(stats, cmdPath, type, featureCode, cmdName || cmdPath)
+
+      if (existingIndex >= 0) {
+        // 已存在，更新使用时间和次数
+        stats[existingIndex].lastUsed = now
+        stats[existingIndex].useCount = (stats[existingIndex].useCount || 0) + 1
+        console.log(`更新统计: ${cmdName || cmdPath}, 使用${stats[existingIndex].useCount}次`)
+      } else {
+        // 新记录
+        stats.push({
+          path: cmdPath,
+          type,
+          featureCode: featureCode || null,
+          name: cmdName || cmdPath,
+          lastUsed: now,
+          useCount: 1
+        })
+        console.log(`新增统计: ${cmdName || cmdPath}, 使用1次`)
+      }
+
+      // 保存统计数据
+      databaseAPI.dbPut('command-usage-stats', stats)
+
+      console.log('[Commands] 使用统计已更新')
+    } catch (error) {
+      console.error('[Commands] 更新使用统计失败:', error)
+    }
+  }
+
+  /**
+   * 从数据库获取插件列表
+   */
+  private getPluginsFromDB(): any[] {
+    try {
+      const plugins = databaseAPI.dbGet('plugins')
+      return plugins || []
+    } catch (error) {
+      console.error('[Commands] 从数据库获取插件列表失败:', error)
+      return []
+    }
+  }
+
+  /**
+   * 获取插件的默认 featureCode（第一个非匹配 feature）
+   */
+  private async getDefaultFeatureCode(
+    pluginPath: string
+  ): Promise<{ success: boolean; featureCode?: string; error?: string }> {
+    try {
+      const pluginJsonPath = path.join(pluginPath, 'plugin.json')
+      const pluginConfig = JSON.parse(await fs.readFile(pluginJsonPath, 'utf-8'))
+
+      if (!pluginConfig.features || pluginConfig.features.length === 0) {
+        return {
+          success: false,
+          error: '该插件没有配置任何功能'
+        }
+      }
+
+      // 查找第一个非匹配 feature
+      for (const feature of pluginConfig.features) {
+        if (!feature.cmds || feature.cmds.length === 0) {
+          // 没有 cmds 的 feature，使用它
+          return { success: true, featureCode: feature.code }
+        }
+
+        // 检查是否有非匹配型命令
+        const hasNonMatchCmd = feature.cmds.some((cmd: any) => {
+          // 如果是字符串，就是文本命令（非匹配）
+          if (typeof cmd === 'string') return true
+          // 如果是对象但没有 type 字段，也算非匹配
+          if (typeof cmd === 'object' && !cmd.type) return true
+          // 否则是匹配型命令（regex 或 over）
+          return false
+        })
+
+        if (hasNonMatchCmd) {
+          return { success: true, featureCode: feature.code }
+        }
+      }
+
+      // 如果都是匹配型 feature，返回错误
+      return {
+        success: false,
+        error: '该插件所有功能都需要通过指令触发，无法直接打开'
+      }
+    } catch (error) {
+      console.error('[Commands] 读取插件配置失败:', error)
+      return {
+        success: false,
+        error: '读取插件配置失败'
+      }
+    }
+  }
+
+  /**
+   * 从历史记录中删除
+   */
+  private removeFromHistory(appPath: string, featureCode?: string, name?: string): void {
+    try {
+      const originalHistory: any[] = databaseAPI.dbGet('command-history') || []
+
+      const history = filterOutCommand(originalHistory, appPath, featureCode, name)
+
+      databaseAPI.dbPut('command-history', history)
+      console.log('[Commands] 已从历史记录删除:', appPath, featureCode)
+
+      // 通知前端重新加载历史记录
+      this.notifyRenderer('history-changed')
+    } catch (error) {
+      console.error('[Commands] 从历史记录删除失败:', error)
+    }
+  }
+
+  /**
+   * 固定应用
+   */
+  public pinApp(app: any): void {
+    try {
+      const pinnedApps: any[] = databaseAPI.dbGet('pinned-commands') || []
+
+      const isDirectApp = app.type === 'direct' && app.subType === 'app'
+      const persistedName = isDirectApp ? app.persistedName || app.name : undefined
+      const matchName =
+        app.type === 'plugin' ? app.pluginName || app.name : persistedName || app.name
+
+      // 检查是否已固定（非插件类型需要同时匹配 name 和 path，支持同路径不同名应用）
+      const exists = hasCommand(pinnedApps, app.path, app.featureCode, matchName)
+
+      if (exists) {
+        console.log('[Commands] 应用已固定:', app.path)
+        return
+      }
+
+      // 添加到固定列表
+      pinnedApps.push({
+        name: persistedName || app.name,
+        path: app.path,
+        icon: app.icon,
+        type: app.type,
+        subType: app.subType,
+        featureCode: app.featureCode,
+        pluginExplain: app.pluginExplain,
+        pinyin: app.pinyin,
+        pinyinAbbr: app.pinyinAbbr,
+        pluginName: app.pluginName,
+        cmdType: app.cmdType,
+        originalName: app.originalName,
+        persistedName: app.persistedName
+      })
+
+      databaseAPI.dbPut('pinned-commands', pinnedApps)
+      console.log('[Commands] 已固定应用:', app.name)
+
+      // 通知前端重新加载固定列表
+      this.notifyRenderer('pinned-changed')
+    } catch (error) {
+      console.error('[Commands] 固定应用失败:', error)
+    }
+  }
+
+  /**
+   * 取消固定
+   */
+  public unpinApp(appPath: string, featureCode?: string, name?: string): void {
+    try {
+      const originalPinnedApps: any[] = databaseAPI.dbGet('pinned-commands') || []
+
+      const pinnedApps = filterOutCommand(originalPinnedApps, appPath, featureCode, name)
+
+      databaseAPI.dbPut('pinned-commands', pinnedApps)
+      console.log('[Commands] 已取消固定:', appPath, featureCode)
+
+      // 通知前端重新加载固定列表
+      this.notifyRenderer('pinned-changed')
+    } catch (error) {
+      console.error('[Commands] 取消固定失败:', error)
+    }
+  }
+
+  /**
+   * 更新固定列表顺序
+   */
+  private updatePinnedOrder(newOrder: any[]): void {
+    try {
+      // 清理数据，只保存必要字段
+      const cleanData = newOrder.map((app) => {
+        const isDirectApp = app.type === 'direct' && app.subType === 'app'
+        return {
+          name: isDirectApp ? app.persistedName || app.name : app.name,
+          path: app.path,
+          icon: app.icon,
+          type: app.type,
+          subType: app.subType,
+          featureCode: app.featureCode,
+          pluginExplain: app.pluginExplain,
+          pinyin: app.pinyin,
+          pinyinAbbr: app.pinyinAbbr,
+          pluginName: app.pluginName,
+          cmdType: app.cmdType,
+          originalName: app.originalName,
+          persistedName: app.persistedName
+        }
+      })
+
+      databaseAPI.dbPut('pinned-commands', cleanData)
+      console.log('[Commands] 固定列表顺序已更新')
+
+      // 通知前端重新加载固定列表
+      this.notifyRenderer('pinned-changed')
+    } catch (error) {
+      console.error('[Commands] 更新固定列表顺序失败:', error)
+    }
+  }
+
+  /**
+   * 从数据库加载上次匹配状态
+   */
+  private loadLastMatchState(): void {
+    try {
+      const state = databaseAPI.dbGet('last-match-state')
+      if (state) {
+        this.lastMatchState = state
+        console.log('[Commands] 加载上次匹配状态:', state)
+      }
+    } catch (error) {
+      console.log('[Commands] 加载上次匹配状态失败:', error)
+    }
+  }
+
+  /**
+   * 保存上次匹配状态到数据库
+   */
+  private saveLastMatchState(): void {
+    try {
+      if (this.lastMatchState) {
+        databaseAPI.dbPut('last-match-state', this.lastMatchState)
+        console.log('[Commands] 保存上次匹配状态到数据库')
+      }
+    } catch (error) {
+      console.error('[Commands] 保存上次匹配状态失败:', error)
+    }
+  }
+
+  /**
+   * 获取上次匹配状态
+   */
+  private getLastMatchState(): LastMatchState | null {
+    return this.lastMatchState
+  }
+
+  /**
+   * 恢复上次匹配
+   */
+  private restoreLastMatch(): LastMatchState | null {
+    return this.lastMatchState
+  }
+
+  /**
+   * 在启动编排成功后记录使用与恢复状态，失败启动不污染用户排序。
+   * @param appPath 插件路径
+   * @param featureCode 实际功能代码
+   * @param name 显示名称
+   * @param cmdType 原始匹配类型
+   * @param param 本次启动快照
+   * @returns 持久化结束的 Promise
+   */
+  private async recordSuccessfulPluginLaunch(
+    appPath: string,
+    featureCode: string,
+    name: string | undefined,
+    cmdType: string | undefined,
+    param: any
+  ): Promise<void> {
+    const type = 'plugin'
+    // 更新指令使用统计（所有指令都统计，用于匹配推荐排序）
+    this.updateUsageStats({ path: appPath, type, featureCode, name })
+
+    // 判断命令类型并决定是否添加历史记录
+    if (cmdType === 'window') {
+      // window 类型：不记录历史，不保存状态（仅用于窗口匹配）
+      console.log('[Commands] window 类型命令，跳过历史记录')
+    } else if (['img', 'over', 'files', 'regex'].includes(cmdType || '')) {
+      // 匹配指令：保存状态并添加"上次匹配"到历史记录
+      // 从param中提取完整的输入状态
+      const inputState = param?.inputState || {}
+
+      if (param?.inputState) {
+        // 保存上次匹配状态（内存+数据库）
+        this.lastMatchState = {
+          searchQuery: inputState.searchQuery || '',
+          pastedImage: inputState.pastedImage || null,
+          pastedFiles: inputState.pastedFiles || null,
+          pastedText: inputState.pastedText || null,
+          timestamp: Date.now()
+        }
+        console.log('[Commands] 保存上次匹配状态:', this.lastMatchState)
+        // 持久化到数据库
+        this.saveLastMatchState()
+
+        // 先删除历史记录中旧的"上次匹配"
+        this.removeFromHistory('special:last-match')
+
+        // 将"上次匹配"作为普通指令加入历史记录
+        await this.addToHistory({
+          path: 'special:last-match',
+          type: 'plugin',
+          name: '上次匹配',
+          cmdType: 'text'
+        })
+      }
+    } else {
+      // 非匹配指令，正常添加到历史记录
+      await this.addToHistory({ path: appPath, type, featureCode, param, name, cmdType })
+    }
+  }
+
+  /**
+   * 为 AllCommands 和设置页提供统一目录的兼容返回结构。
+   * @returns 原始指令、匹配规则与插件列表，不包含内部搜索索引字段
+   */
+  public async getCommands(): Promise<{
+    commands: any[]
+    regexCommands: any[]
+    plugins: any[]
+  }> {
+    if (!this.catalogProvider) return { commands: [], regexCommands: [], plugins: [] }
+    const catalog = await this.catalogProvider()
+    return {
+      commands: catalog.canonical.filter((command) => !command.matchCmd),
+      regexCommands: catalog.canonical.filter((command) => !!command.matchCmd),
+      plugins: catalog.plugins
+    }
+  }
+}
+
+export default new AppsAPI()

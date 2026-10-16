@@ -1,0 +1,331 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>FFmpeg 集成</title>
+    <style>
+      :root {
+        --bg-color: #f4f4f4;
+        --text-color: #333333;
+        --text-secondary: #616161;
+        --border-color: #e5e7eb;
+        --control-bg: rgba(0, 0, 0, 0.035);
+        --hover-bg: #f0f0f0;
+        --primary-color: #0284c7;
+        --primary-hover: color-mix(in srgb, #0284c7, black 10%);
+        --primary-light-bg: color-mix(in srgb, #0284c7, white 80%);
+        --text-on-primary: #ffffff;
+        --danger-color: #dc2626;
+        --titlebar-bg: rgba(0, 0, 0, 0.03);
+        --titlebar-border: rgba(0, 0, 0, 0.06);
+        --progress-track: rgba(0, 0, 0, 0.06);
+      }
+
+      @media (prefers-color-scheme: dark) {
+        :root {
+          --bg-color: #303133;
+          --text-color: #f3f4f6;
+          --text-secondary: #bfc0c3;
+          --border-color: #374151;
+          --control-bg: rgba(255, 255, 255, 0.04);
+          --hover-bg: #374151;
+          --primary-color: #38bdf8;
+          --primary-hover: color-mix(in srgb, #38bdf8, white 10%);
+          --primary-light-bg: color-mix(in srgb, #38bdf8, transparent 92%);
+          --text-on-primary: #ffffff;
+          --danger-color: #f87171;
+          --titlebar-bg: rgba(255, 255, 255, 0.03);
+          --titlebar-border: rgba(255, 255, 255, 0.06);
+          --progress-track: rgba(255, 255, 255, 0.08);
+        }
+      }
+
+      * {
+        margin: 0;
+        padding: 0;
+        box-sizing: border-box;
+      }
+
+      html,
+      body {
+        width: 100%;
+        height: 100%;
+        overflow: hidden;
+        user-select: none;
+      }
+
+      body {
+        font-family:
+          -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+        -webkit-font-smoothing: antialiased;
+        -moz-osx-font-smoothing: grayscale;
+        background-color: var(--bg-color);
+        color: var(--text-color);
+        display: flex;
+        flex-direction: column;
+      }
+
+      /* 标题栏 */
+      .titlebar {
+        height: 48px;
+        display: flex;
+        align-items: center;
+        padding: 0 12px;
+        gap: 10px;
+        border-bottom: 1px solid var(--titlebar-border);
+        background: var(--titlebar-bg);
+        -webkit-app-region: drag;
+        flex-shrink: 0;
+      }
+
+      .titlebar-icon {
+        width: 24px;
+        height: 24px;
+        border-radius: 4px;
+        object-fit: contain;
+        flex-shrink: 0;
+      }
+
+      .titlebar-title {
+        font-size: 13px;
+        font-weight: 500;
+        flex: 1;
+      }
+
+      .titlebar-close {
+        width: 28px;
+        height: 28px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        background: transparent;
+        border: none;
+        border-radius: 6px;
+        color: var(--text-secondary);
+        cursor: pointer;
+        transition: all 0.15s ease;
+        -webkit-app-region: no-drag;
+      }
+
+      .titlebar-close:hover {
+        background: var(--danger-color);
+        color: #ffffff;
+      }
+
+      .titlebar-close svg {
+        width: 10px;
+        height: 10px;
+      }
+
+      /* 主体内容 */
+      .main {
+        flex: 1;
+        display: flex;
+        flex-direction: column;
+        padding: 32px 36px 24px;
+        gap: 28px;
+      }
+
+      /* 说明区域 */
+      .description {
+        display: flex;
+        flex-direction: column;
+        gap: 12px;
+      }
+
+      .description h2 {
+        font-size: 16px;
+        font-weight: 600;
+        line-height: 1.4;
+      }
+
+      .description p {
+        font-size: 13px;
+        line-height: 1.7;
+        color: var(--text-secondary);
+      }
+
+      /* 操作区域 */
+      .actions {
+        display: flex;
+        flex-direction: column;
+        gap: 14px;
+        margin-top: auto;
+      }
+
+      /* 按钮 */
+      .btn-primary {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        gap: 8px;
+        width: 100%;
+        height: 42px;
+        padding: 0 20px;
+        border: none;
+        border-radius: 8px;
+        font-size: 14px;
+        font-weight: 500;
+        font-family: inherit;
+        cursor: pointer;
+        transition: all 0.2s ease;
+        background: var(--primary-color);
+        color: var(--text-on-primary);
+        position: relative;
+        overflow: hidden;
+      }
+
+      .btn-primary:not(:disabled):hover {
+        background: var(--primary-hover);
+      }
+
+      .btn-primary:not(:disabled):active {
+        transform: scale(0.98);
+      }
+
+      .btn-primary:disabled {
+        cursor: default;
+        opacity: 0.85;
+      }
+
+      .btn-primary.error {
+        background: var(--danger-color);
+      }
+
+      /* 进度条 */
+      .progress-track {
+        width: 100%;
+        height: 4px;
+        border-radius: 2px;
+        background: var(--progress-track);
+        overflow: hidden;
+        opacity: 0;
+        transition: opacity 0.3s ease;
+      }
+
+      .progress-track.visible {
+        opacity: 1;
+      }
+
+      .progress-bar {
+        height: 100%;
+        border-radius: 2px;
+        background: var(--primary-color);
+        transition: width 0.3s ease;
+        width: 0%;
+      }
+
+      /* 底部链接 */
+      .footer {
+        text-align: center;
+        padding-bottom: 4px;
+        flex-shrink: 0;
+      }
+
+      .footer-link {
+        font-size: 12px;
+        color: var(--text-secondary);
+        opacity: 0.7;
+        transition: opacity 0.15s ease;
+      }
+
+      .footer-link:hover {
+        opacity: 1;
+      }
+    </style>
+  </head>
+  <body>
+    <!-- 标题栏 -->
+    <div class="titlebar">
+      <img src="icons/icon-ztools.png" class="titlebar-icon" alt="" draggable="false" />
+      <span class="titlebar-title">FFmpeg 集成</span>
+      <button class="titlebar-close" onclick="window.close()" title="关闭">
+        <svg viewBox="0 0 10 10">
+          <path
+            d="M1 1L9 9M9 1L1 9"
+            stroke="currentColor"
+            stroke-width="1.2"
+            stroke-linecap="round"
+          />
+        </svg>
+      </button>
+    </div>
+
+    <!-- 主体 -->
+    <div class="main">
+      <div class="description">
+        <h2>将 FFmpeg 集成到 ZTools</h2>
+        <p>
+          FFmpeg
+          是一款开源的音视频处理工具，集成后可在相关插件中使用音视频转码、格式转换等功能。文件将下载到应用数据目录，不影响系统环境。
+        </p>
+      </div>
+
+      <div class="actions">
+        <div id="progressTrack" class="progress-track">
+          <div id="progressBar" class="progress-bar"></div>
+        </div>
+        <button id="downloadBtn" class="btn-primary">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none">
+            <path
+              d="M21 15V19C21 19.5304 20.7893 20.0391 20.4142 20.4142C20.0391 20.7893 19.5304 21 19 21H5C4.46957 21 3.96086 20.7893 3.58579 20.4142C3.21071 20.0391 3 19.5304 3 19V15"
+              stroke="currentColor"
+              stroke-width="1.5"
+              stroke-linecap="round"
+              stroke-linejoin="round"
+            />
+            <path
+              d="M7 10L12 15L17 10"
+              stroke="currentColor"
+              stroke-width="1.5"
+              stroke-linecap="round"
+              stroke-linejoin="round"
+            />
+            <path
+              d="M12 15V3"
+              stroke="currentColor"
+              stroke-width="1.5"
+              stroke-linecap="round"
+              stroke-linejoin="round"
+            />
+          </svg>
+          下载并集成
+        </button>
+      </div>
+    </div>
+
+    <div class="footer">
+      <span class="footer-link">ffmpeg.org</span>
+    </div>
+
+    <script>
+      const downloadBtn = document.getElementById('downloadBtn')
+      const progressTrack = document.getElementById('progressTrack')
+      const progressBar = document.getElementById('progressBar')
+
+      downloadBtn.addEventListener('click', () => {
+        downloadBtn.disabled = true
+        downloadBtn.innerHTML = '准备下载...'
+        progressTrack.classList.add('visible')
+        location.href = 'ztools://start-download'
+      })
+
+      window.downloadProgressing = (percent) => {
+        downloadBtn.innerHTML = '下载中 ' + percent + '%'
+        progressBar.style.width = percent + '%'
+      }
+
+      window.downloadProgressText = (text) => {
+        downloadBtn.innerHTML = text
+      }
+
+      window.downloadFailed = (message) => {
+        downloadBtn.innerHTML = message
+        downloadBtn.classList.add('error')
+        downloadBtn.disabled = true
+        progressTrack.classList.remove('visible')
+      }
+    </script>
+  </body>
+</html>

@@ -1,0 +1,153 @@
+import { getCommandId, applySpecialConfig } from '../../src/renderer/src/stores/commandUtils'
+
+// ========== getCommandId ==========
+
+describe('getCommandId', () => {
+  it('应生成完整格式的插件 ID', () => {
+    const cmd = {
+      name: '翻译',
+      path: '/plugins/translate',
+      pluginName: 'translate-plugin',
+      featureCode: 'translate',
+      cmdType: 'regex' as const
+    }
+    expect(getCommandId(cmd)).toBe('translate-plugin:translate:翻译:regex')
+  })
+
+  it('direct/app 应使用基于 path 的稳定 ID', () => {
+    const cmd = {
+      name: 'App',
+      path: 'C:\\app.exe',
+      type: 'direct' as const,
+      subType: 'app' as const
+    }
+    expect(getCommandId(cmd)).toBe('direct:app:C:/app.exe')
+  })
+
+  it('cmdType 为 undefined 时插件应默认为 text', () => {
+    const cmd = {
+      name: '功能',
+      path: '/plugin',
+      pluginName: 'test',
+      featureCode: 'feat'
+    }
+    expect(getCommandId(cmd)).toBe('test:feat:功能:text')
+  })
+
+  it('应正确处理 over 类型', () => {
+    const cmd = {
+      name: '超级面板',
+      path: '/plugin',
+      pluginName: 'sp',
+      featureCode: 'panel',
+      cmdType: 'over' as const
+    }
+    expect(getCommandId(cmd)).toBe('sp:panel:超级面板:over')
+  })
+
+  it('应将安装版和开发版同名命令使用不同 pluginName 区分', () => {
+    const installed = getCommandId({
+      name: '优秀待办',
+      path: '/Applications/ExcellentTodo',
+      pluginName: 'excellent-todo',
+      featureCode: 'open'
+    })
+    const development = getCommandId({
+      name: '优秀待办',
+      path: '/workspace/excellent-todo',
+      pluginName: 'excellent-todo__dev',
+      featureCode: 'open'
+    })
+
+    expect(installed).not.toBe(development)
+  })
+
+  it('应将 Windows 反斜杠路径规范化为稳定 ID', () => {
+    const winPath = getCommandId({
+      name: '记事本',
+      path: 'C:\\Windows\\System32\\notepad.exe',
+      type: 'direct' as const,
+      subType: 'app' as const
+    })
+    const normalizedPath = getCommandId({
+      name: '记事本',
+      path: 'C:/Windows/System32/notepad.exe',
+      type: 'direct' as const,
+      subType: 'app' as const
+    })
+
+    expect(winPath).toBe(normalizedPath)
+  })
+
+  it('应区分同名但不同路径的系统应用', () => {
+    const first = getCommandId({
+      name: '微信',
+      path: 'C:\\Program Files\\Tencent\\WeChat.exe',
+      type: 'direct' as const,
+      subType: 'app' as const
+    })
+    const second = getCommandId({
+      name: '微信',
+      path: 'D:\\Portable\\WeChat.exe',
+      type: 'direct' as const,
+      subType: 'app' as const
+    })
+
+    expect(first).not.toBe(second)
+  })
+})
+
+// ========== applySpecialConfig ==========
+
+describe('applySpecialConfig', () => {
+  const specialCommands = {
+    'special:last-match': {
+      name: '上次匹配',
+      icon: 'arrow-icon',
+      type: 'builtin'
+    },
+    'subType:system-setting': {
+      icon: 'settings-icon'
+    }
+  }
+
+  it('应通过 path 精确匹配并合并配置', () => {
+    const cmd = { name: 'old', path: 'special:last-match', type: 'app' }
+    const result = applySpecialConfig(cmd, specialCommands as any)
+    expect(result.name).toBe('上次匹配')
+    expect(result.icon).toBe('arrow-icon')
+    expect(result.type).toBe('builtin')
+    expect(result.path).toBe('special:last-match')
+  })
+
+  it('应通过 subType 匹配并合并配置', () => {
+    const cmd = { name: '蓝牙设置', path: 'ms-settings:bluetooth', subType: 'system-setting' }
+    const result = applySpecialConfig(cmd, specialCommands as any)
+    expect(result.icon).toBe('settings-icon')
+    expect(result.name).toBe('蓝牙设置')
+  })
+
+  it('path 匹配应优先于 subType 匹配', () => {
+    const cmd = {
+      name: 'test',
+      path: 'special:last-match',
+      subType: 'system-setting'
+    }
+    const result = applySpecialConfig(cmd, specialCommands as any)
+    expect(result.name).toBe('上次匹配')
+    expect(result.icon).toBe('arrow-icon')
+  })
+
+  it('无匹配时应原样返回', () => {
+    const cmd = { name: 'Chrome', path: 'C:\\chrome.exe' }
+    const result = applySpecialConfig(cmd, specialCommands as any)
+    expect(result).toEqual(cmd)
+  })
+
+  it('不应修改原始对象', () => {
+    const cmd = { name: 'old', path: 'special:last-match', type: 'app' }
+    const original = { ...cmd }
+    applySpecialConfig(cmd, specialCommands as any)
+    expect(cmd).toEqual(original)
+  })
+})

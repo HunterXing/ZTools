@@ -1,0 +1,24 @@
+{
+  "extends": "@electron-toolkit/tsconfig/tsconfig.node.json",
+  "include": [
+    "electron.vite.config.*",
+    "src/main/**/*",
+    "src/preload/**/*",
+    "src/shared/**/*"
+  ],
+  "compilerOptions": {
+    "composite": true,
+    "paths": {
+      "@shared/*": [
+        "./src/shared/*"
+      ],
+      "@platform-updater": [
+        "./src/main/api/platformUpdater/windows.ts"
+      ]
+    },
+    "types": [
+      "electron-vite/node"
+    ],
+    "allowJs": true
+  }
+}

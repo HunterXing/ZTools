@@ -1,0 +1,916 @@
+import { contextBridge, ipcRenderer, webUtils } from 'electron'
+import type { SearchWallpaperConfig } from '@shared/searchWallpaper'
+import type { AiRequestStatusChange } from '@shared/aiRequestStatus'
+import type { CommandServiceClient, PanelSearchSnapshot } from '@shared/commandService'
+import type { PluginMainWindowLaunchState } from '@shared/pluginLaunch'
+
+const commands: CommandServiceClient = {
+  /**
+   * 查询统一搜索结果。
+   * @param request 输入快照与版本
+   * @returns 搜索结果
+   */
+  query: (request) => ipcRenderer.invoke('commands:query', request),
+  /**
+   * 推进取消版本，立即丢弃旧动态请求。
+   * @param sessionId 会话身份
+   * @param requestId 当前版本
+   * @returns 无返回值
+   */
+  cancel: (sessionId, requestId) => ipcRenderer.send('commands:cancel', sessionId, requestId),
+  /**
+   * 释放已被展示层替换或丢弃的查询快照。
+   * @param sessionId 会话身份
+   * @param requestId 不再展示的查询身份
+   * @returns 无返回值
+   */
+  releaseSearch: (sessionId, requestId) =>
+    ipcRenderer.send('commands:release-search', sessionId, requestId),
+  /**
+   * 交由主进程校验并执行选择。
+   * @param request 结果身份或固定项
+   * @returns 执行结果
+   */
+  execute: (request) => ipcRenderer.invoke('commands:execute', request),
+  /**
+   * 获取主页显示状态。
+   * @returns 历史与固定快照
+   */
+  getHome: () => ipcRenderer.invoke('commands:home'),
+  /**
+   * 获取设置操作需要的指令目录。
+   * @returns 原始指令声明
+   */
+  getCatalog: () => ipcRenderer.invoke('commands:catalog'),
+  /**
+   * 更新推荐置顶状态。
+   * @param operation 置顶动作
+   * @returns 更新后的状态
+   */
+  recommendation: (operation) => ipcRenderer.invoke('commands:recommendation', operation),
+  /**
+   * 订阅按查询身份发布的单个动态分组增量。
+   * @param callback 展示更新回调
+   * @returns 解除订阅函数
+   */
+  onSearchUpdate: (callback) => {
+    const handler = (_event: Electron.IpcRendererEvent, result): void => callback(result)
+    ipcRenderer.on('commands:search-update', handler)
+    return () => ipcRenderer.removeListener('commands:search-update', handler)
+  },
+  /**
+   * 订阅主进程状态失效通知。
+   * @param callback 刷新展示的回调
+   * @returns 解除订阅函数
+   */
+  onStateChanged: (callback) => {
+    const handler = (): void => callback()
+    ipcRenderer.on('commands:state-changed', handler)
+    return () => ipcRenderer.removeListener('commands:state-changed', handler)
+  }
+}
+
+export interface Command {
+  name: string
+  path: string
+  icon?: string
+  type?: string
+  subType?: string
+  cmdType?: string
+  originalName?: string
+  persistedName?: string
+}
+
+export interface PluginUpdateCheckResult {
+  success: boolean
+  updateAvailable: boolean
+  currentVersion?: string
+  latestVersion?: string
+  plugin?: {
+    name: string
+    version: string
+    title?: string
+    logo?: string
+    updatedAt?: number
+  }
+  reason?: string
+  error?: string
+}
+
+export interface PluginMarketDownloadProgress {
+  pluginName: string
+  taskId: string
+  status: 'downloading' | 'installing' | 'success' | 'error' | 'cancelled'
+  progress: number | null
+  receivedBytes?: number
+  totalBytes?: number
+  error?: string
+}
+
+const api = {
+  commands,
+  /**
+   * 提交超级面板项目操作。
+   * @param operation 基于身份的文件夹或排序动作
+   * @returns 更新列表与执行状态
+   */
+  mutateSuperPanelPinned: (
+    operation: import('@shared/commandService').PanelMutation
+  ): Promise<import('@shared/commandService').PanelMutationResult> =>
+    ipcRenderer.invoke('super-panel:mutate-pinned', operation),
+  getApps: () => ipcRenderer.invoke('get-apps'),
+  getSystemSettings: () => ipcRenderer.invoke('get-system-settings'),
+  isWindows: () => ipcRenderer.invoke('is-windows'),
+  launch: (options: {
+    path: string
+    type?: 'direct' | 'plugin' | 'builtin' | 'file'
+    featureCode?: string
+    param?: any
+    name?: string
+    cmdType?: string
+    confirmDialog?: any
+    launchSource?: 'search' | 'global-shortcut' | 'super-panel'
+  }) => ipcRenderer.invoke('launch', options),
+  launchAsAdmin: (appPath: string, name?: string) =>
+    ipcRenderer.invoke('launch-as-admin', appPath, name),
+  hideWindow: () => ipcRenderer.send('hide-window'),
+  resizeWindow: (height: number) => ipcRenderer.send('resize-window', height),
+  updateLaunchContext: (context: {
+    searchQuery: string
+    pastedImage: string | null
+    pastedFiles: Array<{ path: string; name: string; isDirectory: boolean }> | null
+    pastedText: string | null
+  }) => ipcRenderer.send('update-launch-context', context),
+  getWindowPosition: () => ipcRenderer.invoke('get-window-position'),
+  setWindowPosition: (x: number, y: number) => ipcRenderer.send('set-window-position', x, y),
+  setWindowSizeLock: (lock: boolean) => ipcRenderer.send('set-window-size-lock', lock),
+  getWindowMaterial: () => ipcRenderer.invoke('get-window-material'),
+  openExternal: (url: string) => ipcRenderer.invoke('open-external', url),
+  copyToClipboard: (text: string) => ipcRenderer.invoke('copy-to-clipboard', text),
+  openTerminal: (path: string) => ipcRenderer.invoke('open-terminal', path),
+  getFinderPath: () => ipcRenderer.invoke('get-finder-path'),
+  analyzeImage: (imagePath: string) => ipcRenderer.invoke('analyze-image', imagePath),
+  getLastCopiedContent: (timeLimit?: number) =>
+    ipcRenderer.invoke('get-last-copied-content', timeLimit),
+  getFrontmostApp: () => ipcRenderer.invoke('get-frontmost-app'),
+  activateApp: (identifier: string, type?: 'name' | 'bundleId' | 'path') =>
+    ipcRenderer.invoke('activate-app', identifier, type),
+  revealInFinder: (filePath: string) => ipcRenderer.invoke('reveal-in-finder', filePath),
+  showContextMenu: (menuItems: any[]) => ipcRenderer.invoke('show-context-menu', menuItems),
+  getAllPlugins: () => ipcRenderer.invoke('get-all-plugins'),
+  getDisabledPlugins: () => ipcRenderer.invoke('get-disabled-plugins'),
+  setPluginMainPushEnabled: (pluginName: string, enabled: boolean) =>
+    ipcRenderer.invoke('set-plugin-main-push-enabled', pluginName, enabled),
+  killPluginAndReturn: (pluginPath: string) =>
+    ipcRenderer.invoke('kill-plugin-and-return', pluginPath),
+  pluginUpdates: {
+    /**
+     * 检查当前插件是否存在市场新版本。
+     * @param pluginName 当前插件名称
+     * @param pluginPath 当前插件物理路径
+     * @returns 更新检查结果
+     */
+    check: (pluginName: string, pluginPath: string): Promise<PluginUpdateCheckResult> =>
+      ipcRenderer.invoke('check-plugin-update', pluginName, pluginPath),
+    /**
+     * 从插件市场升级指定插件。
+     * @param pluginName 需要升级的插件名称
+     * @param pluginPath 当前插件物理路径
+     * @returns 安装结果
+     */
+    upgrade: (pluginName: string, pluginPath: string): Promise<any> =>
+      ipcRenderer.invoke('upgrade-plugin-from-market', pluginName, pluginPath),
+    /**
+     * 打开指定插件的市场详情页。
+     * @param pluginName 需要查看的插件名称
+     * @returns 打开结果
+     */
+    openMarket: (pluginName: string): Promise<{ success: boolean; error?: string }> =>
+      ipcRenderer.invoke('open-plugin-market-detail', pluginName),
+    /**
+     * 监听当前窗口发起的市场升级进度。
+     * @param callback 接收下载和安装进度的回调函数
+     * @returns 用于移除监听器的清理函数
+     */
+    onProgress: (callback: (payload: PluginMarketDownloadProgress) => void): (() => void) => {
+      const handler = (
+        _event: Electron.IpcRendererEvent,
+        payload: PluginMarketDownloadProgress
+      ): void => callback(payload)
+      ipcRenderer.on('plugin-market-download-progress', handler)
+      return (): void => {
+        ipcRenderer.removeListener('plugin-market-download-progress', handler)
+      }
+    }
+  },
+  // mainPush 功能
+  queryMainPush: (pluginPath: string, featureCode: string, queryData: any) =>
+    ipcRenderer.invoke('query-main-push', pluginPath, featureCode, queryData),
+  selectMainPush: (pluginPath: string, featureCode: string, selectData: any) =>
+    ipcRenderer.invoke('select-main-push', pluginPath, featureCode, selectData),
+  sendInputEvent: (event: any) => ipcRenderer.invoke('send-input-event', event),
+  openSettings: () => ipcRenderer.send('open-settings'),
+  // 历史记录管理
+  removeFromHistory: (appPath: string, featureCode?: string, name?: string) =>
+    ipcRenderer.invoke('remove-from-history', appPath, featureCode, name),
+  // 固定应用管理
+  pinApp: (app: any) => ipcRenderer.invoke('pin-app', app),
+  unpinApp: (appPath: string, featureCode?: string, name?: string) =>
+    ipcRenderer.invoke('unpin-app', appPath, featureCode, name),
+  updatePinnedOrder: (newOrder: any[]) => ipcRenderer.invoke('update-pinned-order', newOrder),
+  hidePlugin: () => ipcRenderer.send('hide-plugin'),
+  onContextMenuCommand: (callback: (command: string) => void) => {
+    const handler = (_event: any, command: string): void => callback(command)
+    ipcRenderer.on('context-menu-command', handler)
+    return (): void => {
+      ipcRenderer.removeListener('context-menu-command', handler)
+    }
+  },
+  onFocusSearch: (
+    callback: (
+      windowInfo?: {
+        app: string
+        bundleId?: string
+        pid?: number
+        title?: string
+        x?: number
+        y?: number
+        width?: number
+        height?: number
+        appPath?: string
+        className?: string
+        hwnd?: number
+      } | null
+    ) => void
+  ) => {
+    ipcRenderer.on('focus-search', (_event, windowInfo) => callback(windowInfo))
+  },
+  onBackToSearch: (callback: () => void) => {
+    ipcRenderer.on('back-to-search', callback)
+  },
+  onRedirectSearch: (callback: (data: { cmdName: string; payload?: any }) => void) => {
+    ipcRenderer.on('redirect-search', (_event, data) => callback(data))
+  },
+  onPluginOpened: (
+    callback: (plugin: {
+      name: string
+      logo: string
+      path: string
+      sourceType?: 'open_source' | 'closed_source'
+    }) => void
+  ) => {
+    ipcRenderer.on('plugin-opened', (_event, plugin) => callback(plugin))
+  },
+  onPluginLoaded: (callback: (plugin: { name: string; path: string }) => void) => {
+    ipcRenderer.on('plugin-loaded', (_event, plugin) => callback(plugin))
+  },
+  onPluginClosed: (callback: () => void) => {
+    ipcRenderer.on('plugin-closed', callback)
+  },
+  onWindowInfoChanged: (
+    callback: (windowInfo: {
+      app: string
+      bundleId?: string
+      pid?: number
+      title?: string
+      x?: number
+      y?: number
+      width?: number
+      height?: number
+      appPath?: string
+      timestamp?: number
+      className?: string
+      hwnd?: number
+    }) => void
+  ) => {
+    ipcRenderer.on('window-info-changed', (_event, windowInfo) => callback(windowInfo))
+  },
+  onPluginsChanged: (callback: () => void) => {
+    ipcRenderer.on('plugins-changed', callback)
+  },
+  onAppsChanged: (callback: () => void) => {
+    ipcRenderer.on('apps-changed', callback)
+  },
+  onLocalShortcutsChanged: (callback: () => void) => {
+    ipcRenderer.on('local-shortcuts-changed', callback)
+  },
+  onCommandAliasesChanged: (callback: () => void) => {
+    ipcRenderer.on('command-aliases-changed', callback)
+  },
+  /**
+   * 订阅主进程在唤起窗口前确定的插件启动状态。
+   * @param callback 接收进入行为和搜索词的宿主回调
+   * @returns 无返回值
+   */
+  onShowPluginPlaceholder: (callback: (state: PluginMainWindowLaunchState) => void) => {
+    // 只转交启动数据，避免将 Electron 事件对象暴露给渲染页面。
+    ipcRenderer.on('show-plugin-placeholder', (_event, state) => callback(state))
+  },
+  onShowSettings: (callback: () => void) => {
+    ipcRenderer.on('show-settings', callback)
+  },
+  onAppLaunched: (callback: () => void) => {
+    ipcRenderer.on('app-launched', callback)
+  },
+  onHistoryChanged: (callback: () => void) => {
+    ipcRenderer.on('history-changed', callback)
+  },
+  onPinnedChanged: (callback: () => void) => {
+    ipcRenderer.on('pinned-changed', callback)
+  },
+  onSuperPanelPinnedChanged: (callback: () => void) => {
+    ipcRenderer.on('super-panel-pinned-changed', callback)
+  },
+  onDisabledCommandsChanged: (callback: () => void) => {
+    ipcRenderer.on('disabled-commands-changed', callback)
+  },
+  onUpdatePlaceholder: (callback: (placeholder: string) => void) => {
+    ipcRenderer.on('update-placeholder', (_event, placeholder) => callback(placeholder))
+  },
+  onUpdateAvatar: (callback: (avatar: string) => void) => {
+    ipcRenderer.on('update-avatar', (_event, avatar) => callback(avatar))
+  },
+  /**
+   * 监听主搜索窗口壁纸的实时配置更新。
+   * @param callback 接收已规范化壁纸配置的回调函数
+   * @returns 用于移除监听器的清理函数
+   */
+  onUpdateSearchWallpaper: (
+    callback: (wallpaper: SearchWallpaperConfig | null) => void
+  ): (() => void) => {
+    const handler = (
+      _event: Electron.IpcRendererEvent,
+      wallpaper: SearchWallpaperConfig | null
+    ): void => callback(wallpaper)
+    ipcRenderer.on('update-search-wallpaper', handler)
+    return (): void => {
+      ipcRenderer.removeListener('update-search-wallpaper', handler)
+    }
+  },
+  /**
+   * 监听带插件身份的 AI 请求状态变化。
+   * @param callback 接收插件级状态变化的回调
+   * @returns 无返回值
+   */
+  onAiStatusChanged: (callback: (change: AiRequestStatusChange) => void): void => {
+    ipcRenderer.on('ai-status-changed', (_event, change) => callback(change))
+  },
+  onUpdateAutoPaste: (callback: (autoPaste: string) => void) => {
+    ipcRenderer.on('update-auto-paste', (_event, autoPaste) => callback(autoPaste))
+  },
+  onUpdateAutoClear: (callback: (autoClear: string) => void) => {
+    ipcRenderer.on('update-auto-clear', (_event, autoClear) => callback(autoClear))
+  },
+  onUpdateShowRecentInSearch: (callback: (showRecentInSearch: boolean) => void) => {
+    ipcRenderer.on('update-show-recent-in-search', (_event, showRecentInSearch) =>
+      callback(showRecentInSearch)
+    )
+  },
+  onUpdateMatchRecommendation: (callback: (showMatchRecommendation: boolean) => void) => {
+    ipcRenderer.on('update-match-recommendation', (_event, showMatchRecommendation) =>
+      callback(showMatchRecommendation)
+    )
+  },
+  onUpdateRecentRows: (callback: (rows: number) => void) => {
+    ipcRenderer.on('update-recent-rows', (_event, rows) => callback(rows))
+  },
+  onUpdatePinnedRows: (callback: (rows: number) => void) => {
+    ipcRenderer.on('update-pinned-rows', (_event, rows) => callback(rows))
+  },
+  onUpdateTabTarget: (callback: (target: string) => void) => {
+    ipcRenderer.on('update-tab-target', (_event, target) => callback(target))
+  },
+  onUpdateTabKeyFunction: (callback: (mode: 'navigate' | 'target-command') => void) => {
+    ipcRenderer.on('update-tab-key-function', (_event, mode) => callback(mode))
+  },
+  onUpdateSpaceOpenCommand: (callback: (enabled: boolean) => void) => {
+    ipcRenderer.on('update-space-open-command', (_event, enabled) => callback(enabled))
+  },
+  onUpdateFloatingBallDoubleClickCommand: (callback: (command: string) => void) => {
+    ipcRenderer.on('update-floating-ball-double-click-command', (_event, command) =>
+      callback(command)
+    )
+  },
+  onUpdateSearchMode: (callback: (mode: string) => void) => {
+    ipcRenderer.on('update-search-mode', (_event, mode) => callback(mode))
+  },
+  onUpdatePrimaryColor: (
+    callback: (data: { primaryColor: string; customColor?: string }) => void
+  ) => {
+    ipcRenderer.on('update-primary-color', (_event, data) => callback(data))
+  },
+  onUpdateWindowMaterial: (callback: (material: 'mica' | 'none') => void) => {
+    ipcRenderer.on('update-window-material', (_event, material) => callback(material))
+  },
+  onUpdateAcrylicOpacity: (
+    callback: (data: { lightOpacity: number; darkOpacity: number }) => void
+  ) => {
+    ipcRenderer.on('update-acrylic-opacity', (_event, data) => callback(data))
+  },
+  /**
+   * 监听主窗口顶部栏密度的实时变化。
+   * @param callback 接收紧凑模式开关的回调函数。
+   * @returns 用于移除监听器的清理函数。
+   */
+  onUpdateCompactMainWindowHeader: (callback: (enabled: boolean) => void): (() => void) => {
+    const handler = (_event: Electron.IpcRendererEvent, enabled: boolean): void => callback(enabled)
+    ipcRenderer.on('update-compact-main-window-header', handler)
+    return (): void => {
+      ipcRenderer.removeListener('update-compact-main-window-header', handler)
+    }
+  },
+  /**
+   * 监听插件内 ESC 直接隐藏设置的实时变化。
+   * @param callback 接收开关状态的回调函数。
+   * @returns 用于移除监听器的清理函数。
+   */
+  onUpdateHideMainWindowOnPluginEsc: (callback: (enabled: boolean) => void): (() => void) => {
+    const handler = (_event: Electron.IpcRendererEvent, enabled: boolean): void => callback(enabled)
+    ipcRenderer.on('update-hide-main-window-on-plugin-esc', handler)
+    return (): void => {
+      ipcRenderer.removeListener('update-hide-main-window-on-plugin-esc', handler)
+    }
+  },
+  onIpcLaunch: (
+    callback: (options: {
+      path: string
+      type?: 'app' | 'direct' | 'plugin' | 'builtin' | 'file'
+      featureCode?: string
+      param?: any
+      name?: string
+      cmdType?: string
+    }) => void
+  ) => {
+    ipcRenderer.on('ipc-launch', (_event, options) => callback(options))
+  },
+  openPluginDevTools: () => ipcRenderer.invoke('open-plugin-devtools'),
+  detachPlugin: () => ipcRenderer.invoke('detach-plugin'),
+  // 快捷键相关
+  updateShortcut: (shortcut: string) => ipcRenderer.invoke('update-shortcut', shortcut),
+  getCurrentShortcut: () => ipcRenderer.invoke('get-current-shortcut'),
+  registerGlobalShortcut: (
+    shortcut: string,
+    target: string,
+    autoCopy?: boolean,
+    preScreenshotOptimization?: boolean
+  ) =>
+    ipcRenderer.invoke(
+      'register-global-shortcut',
+      shortcut,
+      target,
+      autoCopy,
+      preScreenshotOptimization
+    ),
+  unregisterGlobalShortcut: (shortcut: string) =>
+    ipcRenderer.invoke('unregister-global-shortcut', shortcut),
+  updateGlobalShortcutConfig: (
+    shortcut: string,
+    config: { autoCopy: boolean; preScreenshotOptimization: boolean }
+  ) => ipcRenderer.invoke('update-global-shortcut-config', shortcut, config),
+  // 快捷键录制（临时注册，触发后自动注销）
+  startHotkeyRecording: () => ipcRenderer.invoke('start-hotkey-recording'),
+  onHotkeyRecorded: (callback: (shortcut: string) => void) => {
+    ipcRenderer.on('hotkey-recorded', (_event, shortcut) => callback(shortcut))
+  },
+  // 子输入框相关
+  notifySubInputChange: (text: string) => ipcRenderer.send('notify-sub-input-change', text),
+  setSubInputValue: (text: string) => ipcRenderer.invoke('set-sub-input-value', text),
+  onSetSearchText: (callback: (text: string) => void) => {
+    ipcRenderer.on('set-search-text', (_event, text) => callback(text))
+  },
+  onSetSubInputValue: (callback: (text: string) => void) => {
+    ipcRenderer.on('set-sub-input-value', (_event, text) => callback(text))
+  },
+  onFocusSubInput: (callback: () => void) => {
+    ipcRenderer.on('focus-sub-input', callback)
+  },
+  onSelectSubInput: (callback: () => void) => {
+    ipcRenderer.on('select-sub-input', callback)
+  },
+  onUpdateSubInputPlaceholder: (
+    callback: (data: { pluginPath: string; placeholder: string }) => void
+  ) => {
+    ipcRenderer.on('update-sub-input-placeholder', (_event, data) => callback(data))
+  },
+  onUpdateSubInputVisible: (callback: (visible: boolean) => void) => {
+    ipcRenderer.on('update-sub-input-visible', (_event, visible) => callback(visible))
+  },
+  // 数据库相关（主程序专用，直接操作 ZTOOLS 命名空间）
+  dbPut: (key: string, data: any) => ipcRenderer.invoke('ztools:db-put', key, data),
+  dbGet: (key: string) => ipcRenderer.invoke('ztools:db-get', key),
+  // 软件更新
+  updater: {
+    checkUpdate: () => ipcRenderer.invoke('updater:check-update'),
+    showUpdateWindow: () => ipcRenderer.invoke('updater:show-update-window'),
+    startUpdate: (sourceID?: number) => ipcRenderer.invoke('updater:start-update', sourceID),
+    /**
+     * 取消当前正在进行的应用更新下载。
+     * @returns 主进程确认下载已停止后的结果。
+     */
+    cancelUpdate: () => ipcRenderer.invoke('updater:cancel-update'),
+    openDownloadSource: (sourceID: number) =>
+      ipcRenderer.invoke('updater:open-download-source', sourceID),
+    installDownloadedUpdate: () => ipcRenderer.invoke('updater:install-downloaded-update'),
+    getDownloadStatus: () => ipcRenderer.invoke('updater:get-download-status')
+  },
+  onUpdateAvailable: (callback: (data: { version: string; changelog: string }) => void) => {
+    ipcRenderer.on('update-available', (_event, data) => callback(data))
+  },
+  /**
+   * 监听自动检查更新开关变化。
+   * @param callback 接收最新开关状态的回调函数
+   * @returns 用于移除当前监听器的清理函数
+   */
+  onAutoCheckUpdateChanged: (callback: (enabled: boolean) => void) => {
+    const handler = (_event: Electron.IpcRendererEvent, enabled: boolean): void => callback(enabled)
+    ipcRenderer.on('auto-check-update-changed', handler)
+    return (): void => {
+      ipcRenderer.removeListener('auto-check-update-changed', handler)
+    }
+  },
+  onUpdateDownloaded: (callback: (data: { version: string; changelog: string }) => void) => {
+    ipcRenderer.on('update-downloaded', (_event, data) => callback(data))
+  },
+  onUpdateDownloadStart: (callback: (data: { version: string }) => void) => {
+    ipcRenderer.on('update-download-start', (_event, data) => callback(data))
+  },
+  onUpdateDownloadFailed: (callback: (data: { error: string }) => void) => {
+    ipcRenderer.on('update-download-failed', (_event, data) => callback(data))
+  },
+  // 获取系统平台 (darwin, win32, linux)
+  getPlatform: () => ipcRenderer.sendSync('get-platform'),
+  // 上次匹配状态管理
+  getLastMatchState: () => ipcRenderer.invoke('get-last-match-state'),
+  restoreLastMatch: () => ipcRenderer.invoke('restore-last-match'),
+  // 使用统计管理
+  getUsageStats: () => ipcRenderer.invoke('get-usage-stats'),
+  // 本地启动管理
+  localShortcuts: {
+    getAll: () => ipcRenderer.invoke('local-shortcuts:get-all'),
+    add: (type: 'file' | 'folder') => ipcRenderer.invoke('local-shortcuts:add', type),
+    delete: (id: string) => ipcRenderer.invoke('local-shortcuts:delete', id),
+    deleteWhenNotExist: () => ipcRenderer.invoke('local-shortcuts:delete-when-not-exist'),
+    open: (path: string) => ipcRenderer.invoke('local-shortcuts:open', path),
+    updateAlias: (id: string, alias: string) =>
+      ipcRenderer.invoke('local-shortcuts:update-alias', id, alias)
+  },
+  // 文件系统检查（异步，通过主进程）
+  checkFilePaths: (paths: string[]) => ipcRenderer.invoke('check-file-paths', paths),
+  // 获取拖放文件的路径（Electron webUtils）
+  getPathForFile: (file: File) => webUtils.getPathForFile(file),
+  // 超级面板相关
+  onSuperPanelData: (
+    callback: (data: {
+      type: string
+      commands?: any[]
+      results?: any[]
+      snapshot?: PanelSearchSnapshot
+      clipboardContent?: any
+    }) => void
+  ) => {
+    ipcRenderer.on('super-panel-data', (_event, data) => callback(data))
+  },
+  /**
+   * 执行面板当前展示项，查询快照独立于可持久化的指令数据。
+   * @param command 所选指令
+   * @param snapshot 所选项所属的展示快照
+   * @returns 启动结果
+   */
+  superPanelLaunch: (command: any, snapshot?: PanelSearchSnapshot) =>
+    ipcRenderer.invoke('super-panel:launch', command, snapshot),
+  /**
+   * 页面替换结果后释放不再展示的面板查询。
+   * @param snapshot 被替换的展示快照
+   * @returns 无返回值
+   */
+  superPanelReleaseSearch: (snapshot: PanelSearchSnapshot) =>
+    ipcRenderer.send('super-panel:release-search', snapshot),
+  superPanelReady: () => ipcRenderer.send('super-panel:ready'),
+  superPanelShowPinned: () => ipcRenderer.send('super-panel:show-pinned'),
+  superPanelShowMainWindow: () => ipcRenderer.send('super-panel:show-main-window'),
+  // 悬浮球
+  floatingBall: {
+    setEnabled: (enabled: boolean) => ipcRenderer.invoke('floating-ball:set-enabled', enabled),
+    getEnabled: () => ipcRenderer.invoke('floating-ball:get-enabled')
+  },
+  onFloatingBallFiles: (
+    callback: (files: Array<{ path: string; name: string; isDirectory: boolean }>) => void
+  ) => {
+    ipcRenderer.on('floating-ball-files', (_event, files) => callback(files))
+  },
+  onFloatingBallDoubleClickCommand: (callback: (command: string) => void) => {
+    ipcRenderer.on('floating-ball-double-click-command', (_event, command) => callback(command))
+  },
+  updateSuperPanelPinnedOrder: (commands: any[]) =>
+    ipcRenderer.invoke('super-panel:update-pinned-order', commands),
+  unpinSuperPanelCommand: (path: string, featureCode?: string) =>
+    ipcRenderer.invoke('super-panel:unpin-command', path, featureCode),
+  pinToSuperPanel: (command: any) => ipcRenderer.invoke('super-panel:pin-command', command),
+  getSuperPanelPinned: () => ipcRenderer.invoke('super-panel:get-pinned'),
+  superPanelAddBlockedApp: () => ipcRenderer.invoke('super-panel:add-blocked-app'),
+  // 超级面板窗口匹配
+  superPanelGetFileLocationWindows: () =>
+    ipcRenderer.invoke('super-panel:get-file-location-windows'),
+  superPanelIsFileLocationWindow: (hwnd: number) =>
+    ipcRenderer.invoke('super-panel:is-file-location-window', hwnd),
+  superPanelSetFileLocationAddressBar: (target: number | FileLocationWindowInfo, address: string) =>
+    ipcRenderer.invoke('super-panel:set-file-location-address-bar', target, address),
+  superPanelSearchWindowCommands: (windowInfo: SuperPanelWindowInfo) =>
+    ipcRenderer.invoke('super-panel:search-window-commands', windowInfo),
+  onSuperPanelWindowCommandsData: (
+    callback: (data: { results: any[]; snapshot?: PanelSearchSnapshot }) => void
+  ) => {
+    ipcRenderer.on('super-panel-window-commands-data', (_event, data) => callback(data))
+  },
+  onSuperPanelTranslation: (callback: (data: { text: string; sourceText?: string }) => void) => {
+    ipcRenderer.on('super-panel-translation', (_event, data) => callback(data))
+  }
+}
+
+contextBridge.exposeInMainWorld('ztools', api)
+
+// 为标题栏暴露 electron API
+contextBridge.exposeInMainWorld('electron', {
+  ipcRenderer: {
+    send: (channel: string, ...args: any[]): void => ipcRenderer.send(channel, ...args),
+    on: (channel: string, callback: (...args: any[]) => void): (() => void) => {
+      const subscription = (_event: any, ...args: any[]): void => callback(...args)
+      ipcRenderer.on(channel, subscription)
+      return (): void => {
+        ipcRenderer.removeListener(channel, subscription)
+      }
+    }
+  }
+})
+
+// TypeScript 类型定义
+type SuperPanelWindowInfo = {
+  platform?: 'win32' | 'darwin'
+  kind?: 'windows-explorer' | 'windows-file-dialog' | 'mac-finder' | 'mac-file-dialog'
+  preciseTarget?: boolean
+  app?: string
+  title?: string
+  className?: string
+  hwnd?: number
+  windowId?: number
+  finderId?: number
+  bundleId?: string
+  pid?: number
+  path?: string
+  url?: string
+  axRole?: string
+  axSubrole?: string
+}
+
+type FileLocationWindowInfo = SuperPanelWindowInfo
+
+declare global {
+  interface Window {
+    electron: {
+      ipcRenderer: {
+        send: (channel: string, ...args: any[]) => void
+        on: (channel: string, callback: (...args: any[]) => void) => () => void
+      }
+    }
+    ztools: {
+      commands: CommandServiceClient
+      mutateSuperPanelPinned: (
+        operation: import('@shared/commandService').PanelMutation
+      ) => Promise<import('@shared/commandService').PanelMutationResult>
+      getApps: () => Promise<Command[]>
+      getSystemSettings: () => Promise<any[]>
+      isWindows: () => Promise<boolean>
+      launch: (options: {
+        path: string
+        type?: 'direct' | 'plugin' | 'builtin' | 'file'
+        featureCode?: string
+        param?: any
+        name?: string
+        cmdType?: string
+        confirmDialog?: any
+        launchSource?: 'search' | 'global-shortcut' | 'super-panel'
+      }) => Promise<void>
+      hideWindow: () => void
+      resizeWindow: (height: number) => void
+      onUpdateCompactMainWindowHeader: (callback: (enabled: boolean) => void) => () => void
+      onUpdateHideMainWindowOnPluginEsc: (callback: (enabled: boolean) => void) => () => void
+      updateLaunchContext: (context: {
+        searchQuery: string
+        pastedImage: string | null
+        pastedFiles: Array<{ path: string; name: string; isDirectory: boolean }> | null
+        pastedText: string | null
+      }) => void
+      getWindowMaterial: () => Promise<'mica' | 'acrylic' | 'none'>
+      openExternal: (url: string) => Promise<void>
+      copyToClipboard: (text: string) => Promise<void>
+      openTerminal: (path: string) => Promise<void>
+      getFinderPath: () => Promise<string | null>
+      getLastCopiedText: (timeLimit: number) => Promise<string | null>
+      getFrontmostApp: () => Promise<{
+        name: string
+        bundleId: string
+        path: string
+      } | null>
+      activateApp: (
+        identifier: string,
+        type?: 'name' | 'bundleId' | 'path'
+      ) => Promise<{ success: boolean; error?: string }>
+      revealInFinder: (filePath: string) => Promise<void>
+      showContextMenu: (menuItems: any[]) => Promise<void>
+      getAllPlugins: () => Promise<any[]>
+      getDisabledPlugins: () => Promise<string[]>
+      setPluginMainPushEnabled: (
+        pluginName: string,
+        enabled: boolean
+      ) => Promise<{ success: boolean; error?: string }>
+      killPluginAndReturn: (pluginPath: string) => Promise<{ success: boolean; error?: string }>
+      pluginUpdates: {
+        check: (pluginName: string, pluginPath: string) => Promise<PluginUpdateCheckResult>
+        upgrade: (
+          pluginName: string,
+          pluginPath: string
+        ) => Promise<{
+          success: boolean
+          error?: string
+          plugin?: any
+          cancelled?: boolean
+        }>
+        openMarket: (pluginName: string) => Promise<{ success: boolean; error?: string }>
+        onProgress: (callback: (payload: PluginMarketDownloadProgress) => void) => () => void
+      }
+      // mainPush 功能
+      queryMainPush: (
+        pluginPath: string,
+        featureCode: string,
+        queryData: { code: string; type: string; payload: string }
+      ) => Promise<any[]>
+      selectMainPush: (
+        pluginPath: string,
+        featureCode: string,
+        selectData: { code: string; type: string; payload: string; option: any }
+      ) => Promise<boolean>
+      sendInputEvent: (event: {
+        type: 'keyDown' | 'keyUp' | 'char' | 'mouseDown' | 'mouseUp' | 'mouseMove'
+        keyCode?: string
+        modifiers?: Array<'shift' | 'ctrl' | 'alt' | 'meta'>
+        x?: number
+        y?: number
+        button?: 'left' | 'right' | 'middle'
+        clickCount?: number
+      }) => Promise<{ success: boolean; error?: string }>
+      // 历史记录管理
+      removeFromHistory: (appPath: string, featureCode?: string, name?: string) => Promise<void>
+      // 固定应用管理
+      pinApp: (app: any) => Promise<void>
+      unpinApp: (appPath: string, featureCode?: string, name?: string) => Promise<void>
+      updatePinnedOrder: (newOrder: any[]) => Promise<void>
+      hidePlugin: () => void
+      onContextMenuCommand: (callback: (command: string) => void) => () => void
+      onFocusSearch: (
+        callback: (
+          windowInfo?: {
+            app: string
+            bundleId?: string
+            pid?: number
+            title?: string
+            x?: number
+            y?: number
+            width?: number
+            height?: number
+            appPath?: string
+            timestamp?: number
+            className?: string
+            hwnd?: number
+          } | null
+        ) => void
+      ) => void
+      onBackToSearch: (callback: () => void) => void
+      onPluginOpened: (
+        callback: (plugin: { name: string; logo: string; path: string }) => void
+      ) => void
+      onPluginClosed: (callback: () => void) => void
+      onWindowInfoChanged: (
+        callback: (windowInfo: {
+          app: string
+          bundleId?: string
+          pid?: number
+          title?: string
+          x?: number
+          y?: number
+          width?: number
+          height?: number
+          appPath?: string
+          timestamp?: number
+          className?: string
+          hwnd?: number
+        }) => void
+      ) => void
+      onPluginsChanged: (callback: () => void) => void
+      onAppsChanged: (callback: () => void) => void
+      onLocalShortcutsChanged: (callback: () => void) => void
+      onCommandAliasesChanged: (callback: () => void) => void
+      onShowPluginPlaceholder: (callback: (state: PluginMainWindowLaunchState) => void) => void
+      onShowSettings: (callback: () => void) => void
+      onAppLaunched: (callback: () => void) => void
+      onHistoryChanged: (callback: () => void) => void
+      onPinnedChanged: (callback: () => void) => void
+      onSuperPanelPinnedChanged: (callback: () => void) => void
+      onIpcLaunch: (
+        callback: (options: {
+          path: string
+          type?: 'app' | 'direct' | 'plugin' | 'builtin' | 'file'
+          featureCode?: string
+          param?: any
+          name?: string
+          cmdType?: string
+        }) => void
+      ) => void
+      onRedirectSearch: (callback: (data: { cmdName: string; payload?: any }) => void) => void
+      onSetSubInputValue: (callback: (text: string) => void) => void
+      onFocusSubInput: (callback: () => void) => void
+      openPluginDevTools: () => Promise<{ success: boolean; error?: string }>
+      detachPlugin: () => Promise<{ success: boolean; error?: string }>
+      // 快捷键相关
+      updateShortcut: (shortcut: string) => Promise<{ success: boolean; error?: string }>
+      getCurrentShortcut: () => Promise<string>
+      registerGlobalShortcut: (
+        shortcut: string,
+        target: string,
+        autoCopy?: boolean,
+        preScreenshotOptimization?: boolean
+      ) => Promise<{ success: boolean; error?: string }>
+      unregisterGlobalShortcut: (shortcut: string) => Promise<{ success: boolean; error?: string }>
+      updateGlobalShortcutConfig: (
+        shortcut: string,
+        config: { autoCopy: boolean; preScreenshotOptimization: boolean }
+      ) => Promise<{ success: boolean; error?: string }>
+      // 窗口相关
+      windowPaste: () => Promise<{ success: boolean; error?: string }>
+      // 子输入框相关
+      notifySubInputChange: (text: string) => void
+      onUpdateSubInputPlaceholder: (
+        callback: (data: { pluginPath: string; placeholder: string }) => void
+      ) => void
+      onUpdateSubInputVisible: (callback: (visible: boolean) => void) => void
+      onUpdateTabTarget: (callback: (target: string) => void) => void
+      onUpdateTabKeyFunction: (callback: (mode: 'navigate' | 'target-command') => void) => void
+      onUpdateSpaceOpenCommand: (callback: (enabled: boolean) => void) => void
+      onUpdateShowRecentInSearch: (callback: (showRecentInSearch: boolean) => void) => void
+      onUpdateMatchRecommendation: (callback: (showMatchRecommendation: boolean) => void) => void
+      onAutoCheckUpdateChanged: (callback: (enabled: boolean) => void) => () => void
+      // 数据库相关（主程序专用，直接操作 ZTOOLS 命名空间）
+      dbPut: (key: string, data: any) => Promise<any>
+      dbGet: (key: string) => Promise<any>
+      // 应用信息
+      getPlatform: () => NodeJS.Platform
+      // 上次匹配状态管理
+      getLastMatchState: () => Promise<any>
+      restoreLastMatch: () => Promise<any>
+      // 使用统计管理
+      getUsageStats: () => Promise<
+        Array<{
+          path: string
+          type: string
+          featureCode?: string | null
+          name: string
+          lastUsed: number
+          useCount: number
+        }>
+      >
+      // 超级面板相关
+      updateSuperPanelPinnedOrder: (
+        commands: any[]
+      ) => Promise<{ success: boolean; error?: string }>
+      superPanelShowMainWindow: () => void
+      unpinSuperPanelCommand: (
+        path: string,
+        featureCode?: string
+      ) => Promise<{ success: boolean; error?: string }>
+      superPanelGetFileLocationWindows: () => Promise<Array<FileLocationWindowInfo | string>>
+      superPanelIsFileLocationWindow: (
+        hwnd: number
+      ) => Promise<{ supported: boolean; isFileLocation: boolean }>
+      superPanelSetFileLocationAddressBar: (
+        target: number | FileLocationWindowInfo,
+        address: string
+      ) => Promise<boolean>
+      superPanelSearchWindowCommands: (windowInfo: SuperPanelWindowInfo) => Promise<void>
+      onSuperPanelWindowCommandsData: (
+        callback: (data: {
+          requestId?: number
+          results: any[]
+          snapshot?: PanelSearchSnapshot
+        }) => void
+      ) => void
+      // 悬浮球
+      floatingBall: {
+        setEnabled: (enabled: boolean) => Promise<{ success: boolean }>
+        getEnabled: () => Promise<boolean>
+      }
+      onFloatingBallFiles: (
+        callback: (files: Array<{ path: string; name: string; isDirectory: boolean }>) => void
+      ) => void
+      onFloatingBallDoubleClickCommand: (callback: (command: string) => void) => void
+    }
+  }
+}
