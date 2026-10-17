@@ -3,8 +3,9 @@ import { defineConfig } from 'vite'
 import UnoCSS from 'unocss/vite'
 import { fileURLToPath, URL } from 'node:url'
 
+// 自建版：官方同步地址使用不可路由的保留域名，确保任何误用都不会真正出站。
 const officialSyncServerUrl =
-  process.env.ZTOOLS_OFFICIAL_SYNC_SERVER_URL?.trim() || 'https://z-tools.top'
+  process.env.ZTOOLS_OFFICIAL_SYNC_SERVER_URL?.trim() || 'https://official.invalid'
 
 // https://vitejs.dev/config/
 export default defineConfig({

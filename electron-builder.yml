@@ -18,6 +18,7 @@ files:
   - '!{.claude/**,.githooks/**,.github/**}'
   - '!AGENTS.md'
   - '!docs/**'
+  - '!BUILD-PLAN.md'
   - '!tests/**'
   - '!updater/**'
   - '!ztools-api-types/**'
