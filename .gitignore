@@ -19,3 +19,6 @@ test-results
 .pnpm-store/*
 _*
 /.sanshu-memory
+
+# 本地构建产物
+/dist/
