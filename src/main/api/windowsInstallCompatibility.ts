@@ -125,7 +125,7 @@ export async function getWindowsInstallCompatibility(): Promise<WindowsInstallCo
     const updateConfig = yaml.parse(await fs.readFile(updateConfigPath, 'utf8'))
     hasUpdateConfig =
       updateConfig?.provider === 'github' &&
-      updateConfig?.owner === 'ZToolsCenter' &&
+      updateConfig?.owner === 'HunterXing' &&
       updateConfig?.repo === 'ZTools'
   } catch {
     hasUpdateConfig = false

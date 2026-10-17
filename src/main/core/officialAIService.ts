@@ -107,8 +107,20 @@ export function toProviderModel(model: OfficialAiModel): AiProviderModel {
 
 /**
  * 管理官方模型目录、登录凭据和只读虚拟供应商。
+ *
+ * 自建版停用说明：本 fork 不使用任何 ZTools 官方服务。下方 `officialDisabled`
+ * 守卫在所有对外方法入口短路，使官方模型目录、积分、签到与充值接口永不发起
+ * 网络请求；调用方无需改动即自动退化为「仅本地模型」。
  */
 class OfficialAIService {
+  /** 自建版恒为真：禁止一切官方服务端交互。 */
+  private static readonly officialDisabled = true
+
+  /** 空目录：官方 AI 停用后对外呈现的模型集合。 */
+  private static emptyCatalog(): OfficialAiModelCatalog {
+    return { provider: { id: '', name: '' }, models: [] }
+  }
+
   private catalogCache: { value: OfficialAiModelCatalog; expiresAt: number } | null = null
 
   /**
@@ -118,6 +130,8 @@ class OfficialAIService {
    * @throws 官方模型接口不可访问或响应格式无效时抛出错误
    */
   public async getCatalog(force = false): Promise<OfficialAiModelCatalog> {
+    // 自建版：不请求官方模型目录，直接返回空集合。
+    if (OfficialAIService.officialDisabled) return OfficialAIService.emptyCatalog()
     if (process.env.ZTOOLS_E2E === '1') return this.e2eCatalog()
     if (!force && this.catalogCache && this.catalogCache.expiresAt > Date.now()) {
       return this.catalogCache.value
@@ -139,6 +153,10 @@ class OfficialAIService {
    * @returns 登录状态和公开模型目录
    */
   public async getProviderStatus(): Promise<OfficialAiProviderStatus> {
+    // 自建版：无官方账号，恒为未登录。
+    if (OfficialAIService.officialDisabled) {
+      return { loggedIn: false, catalog: OfficialAIService.emptyCatalog() }
+    }
     const [session, catalog] = await Promise.all([loadOfficialAccountSession(), this.getCatalog()])
     return { loggedIn: Boolean(session?.token), catalog }
   }
@@ -234,6 +252,8 @@ class OfficialAIService {
    * @returns 当前账号可使用的官方模型选择项
    */
   public async getModelChoices(): Promise<AiModelChoice[]> {
+    // 自建版：不暴露任何官方模型选项。
+    if (OfficialAIService.officialDisabled) return []
     const session = await this.loadUsableSession()
     if (!session?.token) return []
     const catalog = await this.getCatalog()
@@ -268,6 +288,8 @@ class OfficialAIService {
    * @returns 是否为官方稳定 ID 或官方公开 ID
    */
   public isOfficialReference(modelRef?: string): boolean {
+    // 自建版：不存在官方模型引用。
+    if (OfficialAIService.officialDisabled) return false
     return Boolean(
       modelRef?.startsWith(OFFICIAL_MODEL_REF_PREFIX) ||
       modelRef?.startsWith(`${OFFICIAL_PROVIDER_NAME} - `)
@@ -280,6 +302,8 @@ class OfficialAIService {
    * @returns 官方调用配置；未登录或未匹配时返回 null
    */
   public async resolveModel(modelRef?: string): Promise<ResolvedOfficialAiModel | null> {
+    // 自建版：不解析官方模型配置。
+    if (OfficialAIService.officialDisabled) return null
     const session = await this.loadUsableSession()
     if (!session?.token) return null
     const catalog = await this.getCatalog()
@@ -335,6 +359,8 @@ class OfficialAIService {
     init: RequestInit,
     fallbackError: string
   ): Promise<T> {
+    // 自建版：官方积分、签到与充值接口一律不出站。
+    if (OfficialAIService.officialDisabled) throw new Error('自建版未启用官方 AI 服务')
     let session = await this.loadUsableSession()
     if (!session?.token) throw new Error('未登录')
     const endpoint = `${OFFICIAL_SERVER_HTTP_URL}${path}`

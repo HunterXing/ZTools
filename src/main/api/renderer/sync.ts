@@ -8,7 +8,6 @@ import { SyncConfig } from '../../core/sync/types'
 import lmdbInstance, { storageManager } from '../../core/lmdb/lmdbInstance'
 import pluginDeviceAPI from '../plugin/device'
 import { defaultAccountImportService } from '../../core/storage/defaultAccountImportService'
-import activityHeartbeatService from '../../core/activity/heartbeatService'
 import { cacheUserProfile } from '../../core/account/userProfileStore'
 import {
   clearOfficialAccountSession,
@@ -286,7 +285,6 @@ export class SyncAPI {
       // 只清除令牌，保留服务器地址和用户名供下次登录预填。
       await clearPrivateSyncSession()
       this.scheduleStatusChanged()
-      activityHeartbeatService.runNow()
       return { success: true }
     } catch (error: any) {
       return { success: false, error: error.message }
@@ -367,7 +365,6 @@ export class SyncAPI {
             refreshToken: login.refreshToken
           })
           storageManager.switchAccount(params.username)
-          activityHeartbeatService.runNow()
           return login
         } catch (error: any) {
           return { success: false, error: error.message }
@@ -381,7 +378,6 @@ export class SyncAPI {
         try {
           await saveOfficialAccountSession(params)
           storageManager.switchAccount(params.username)
-          activityHeartbeatService.runNow()
           return { success: true }
         } catch (error: any) {
           return { success: false, error: error.message }
@@ -393,7 +389,6 @@ export class SyncAPI {
       try {
         await clearOfficialAccountSession()
         storageManager.switchAccount(null)
-        activityHeartbeatService.runNow()
         return { success: true }
       } catch (error: any) {
         return { success: false, error: error.message }
@@ -441,7 +436,6 @@ export class SyncAPI {
           this.syncClient?.stop()
           await clearOfficialAccountSession()
           storageManager.switchAccount(null)
-          activityHeartbeatService.runNow()
           return { success: true }
         } catch (error: any) {
           return { success: false, error: error.message || '修改密码失败' }
@@ -491,7 +485,6 @@ export class SyncAPI {
         this.syncClient?.stop()
         await clearOfficialAccountSession()
         storageManager.deleteCurrentAccount(accountUid)
-        activityHeartbeatService.runNow()
         return { success: true }
       } catch (error: any) {
         return { success: false, error: error.message }
@@ -556,7 +549,6 @@ export class SyncAPI {
         }
 
         this.scheduleStatusChanged()
-        activityHeartbeatService.runNow()
         return { success: true }
       } catch (error: any) {
         return { success: false, error: error.message }

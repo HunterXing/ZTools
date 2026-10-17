@@ -8,7 +8,6 @@ import updaterAPI from './api/updater'
 import appsAPI from './api/renderer/commands'
 import pluginsAPI from './api/renderer/plugins'
 import appWatcher from './appWatcher'
-import activityHeartbeatService from './core/activity/heartbeatService'
 import {
   ensureMacAccessibilityPermission,
   focusAccessibilityPermissionWindow,
@@ -159,7 +158,6 @@ app.whenReady().then(async () => {
       appsAPI.setAfterFirstAppsReadyCallback(() => {
         appWatcher.init(mainWindow)
       })
-      activityHeartbeatService.start()
     }
   }
 
@@ -233,7 +231,6 @@ app.on('will-quit', () => {
   // 关闭 MCP 服务器
   mcpServer.stop()
   // 停止活动心跳
-  activityHeartbeatService.stop()
 })
 
 app.on('before-quit', (event) => {

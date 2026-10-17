@@ -1,4 +1,4 @@
-import { OFFICIAL_SYNC_SERVER_URL, isOfficialSyncServerUrl } from '../../../shared/syncServerUrl'
+import { OFFICIAL_SYNC_SERVER_URL } from '../../../shared/syncServerUrl'
 import {
   CredentialSessionService,
   type CredentialRefreshResult,
@@ -101,11 +101,10 @@ export function onOfficialAccountInvalidated(
 }
 
 /**
- * 将当前或受信任历史官方地址的会话统一到当前官方地址。
- * @param session 待校验的设备级账号会话。
- * @returns 指向当前官方服务的会话；来源不可信时返回 null。
+ * 自建版恒定禁用官方账号：本 fork 只使用自建同步服务，不再向官方站点认证。
+ * @param _session 待校验的设备级账号会话；自建版不使用。
+ * @returns 恒为 null，表示不存在官方账号会话。
  */
-function normalizeOfficialSession(session: CredentialSession | null): CredentialSession | null {
-  if (!session || !isOfficialSyncServerUrl(session.serverUrl)) return null
-  return { ...session, serverUrl: OFFICIAL_SYNC_SERVER_URL }
+function normalizeOfficialSession(_session: CredentialSession | null): CredentialSession | null {
+  return null
 }

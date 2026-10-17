@@ -178,11 +178,7 @@ const homeRoutes: MenuRouterItemType[] = [
       }
     }
   },
-  {
-    path: '/account',
-    name: 'Account',
-    component: () => import('@/views/AccountSetting/AccountSetting.vue')
-  },
+  // 自建版移除官方账号路由，账号中心不再提供。
   {
     path: '/notifications',
     name: 'Notifications',

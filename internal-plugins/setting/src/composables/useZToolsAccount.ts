@@ -1,6 +1,7 @@
-import { OFFICIAL_SYNC_SERVER_URL } from '@shared/syncServerUrl'
+import { SELF_HOSTED_SYNC_SERVER_URL } from '@shared/syncServerUrl'
 
-export const ONLINE_SYNC_SERVER_URL = OFFICIAL_SYNC_SERVER_URL
+// 自建版：同步地址直接指向自建服务，不使用官方地址。
+export const ONLINE_SYNC_SERVER_URL = SELF_HOSTED_SYNC_SERVER_URL
 export const ACCOUNT_CHANGED_EVENT = 'ztools-account-changed'
 
 export interface ZToolsLoginPayload {

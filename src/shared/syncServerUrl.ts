@@ -1,14 +1,22 @@
 declare const __ZTOOLS_OFFICIAL_SYNC_SERVER_URL__: string
 
+// 自建版说明：本 fork 不连接任何 ZTools 官方服务。以下「官方地址」是保留的语义
+// 判据（用于区分 official / private 两种部署模式），取值指向不可路由的保留域名，
+// 保证即便有代码路径误用它也无法真正出站。自建同步服务请填 SELF_HOSTED_SYNC_URL。
+const SELF_HOSTED_SYNC_URL = 'wss://ztools.xingheng.work'
+
 // 官方配置只接受 HTTP(S)；API 直接使用该地址，仅同步侧派生 WebSocket 地址。
 const configuredServerUrl =
   typeof __ZTOOLS_OFFICIAL_SYNC_SERVER_URL__ === 'string'
-    ? __ZTOOLS_OFFICIAL_SYNC_SERVER_URL__.trim() || 'https://z-tools.top'
-    : 'https://z-tools.top'
+    ? __ZTOOLS_OFFICIAL_SYNC_SERVER_URL__.trim() || 'https://official.invalid'
+    : 'https://official.invalid'
 export const OFFICIAL_SERVER_HTTP_URL = normalizeHttpServerUrl(configuredServerUrl)
 export const OFFICIAL_SYNC_SERVER_URL = normalizeSyncServerUrl(OFFICIAL_SERVER_HTTP_URL)
-// 3.2.0 使用过该官方域名，保留信任以便原 token 无感迁回主域名。
-export const LEGACY_OFFICIAL_SYNC_SERVER_URLS = ['wss://z.zosen.link'] as const
+/** 自建同步服务地址：默认启用，作为本 fork 的唯一同步源。 */
+export const SELF_HOSTED_SYNC_SERVER_URL = normalizeSyncServerUrl(SELF_HOSTED_SYNC_URL)
+
+// 3.2.0 使用过的官方域名仍登记在迁移白名单中，仅用于识别并拒绝旧数据，不作连接目标。
+export const LEGACY_OFFICIAL_SYNC_SERVER_URLS = ['wss://z.zosen.link', 'wss://z-tools.top'] as const
 
 const TRUSTED_OFFICIAL_SYNC_SERVER_URLS = new Set<string>([
   OFFICIAL_SYNC_SERVER_URL,

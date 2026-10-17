@@ -1,4 +1,8 @@
-import { OFFICIAL_SYNC_SERVER_URL, isOfficialSyncServerUrl } from '../../../shared/syncServerUrl'
+import {
+  OFFICIAL_SYNC_SERVER_URL,
+  SELF_HOSTED_SYNC_SERVER_URL,
+  isOfficialSyncServerUrl
+} from '../../../shared/syncServerUrl'
 import {
   clearOfficialRejectedAccessToken,
   loadOfficialAccountSession,
@@ -222,16 +226,17 @@ export async function migrateLegacySyncConfig(): Promise<void> {
  */
 function normalizeProfile(value: unknown): SyncProfile {
   const source = value && typeof value === 'object' ? (value as Partial<SyncProfile>) : {}
-  const provider: SyncProvider = source.provider === 'private' ? 'private' : 'official'
+  // 自建版：未显式配置时默认使用自建同步服务，而非官方部署模式。
+  const provider: SyncProvider = source.provider === 'official' ? 'official' : 'private'
   return {
     provider,
     enabled: Boolean(source.enabled),
     serverUrl:
       provider === 'official'
         ? OFFICIAL_SYNC_SERVER_URL
-        : typeof source.serverUrl === 'string'
+        : typeof source.serverUrl === 'string' && source.serverUrl
           ? source.serverUrl
-          : '',
+          : SELF_HOSTED_SYNC_SERVER_URL,
     syncInterval:
       typeof source.syncInterval === 'number' && source.syncInterval > 0 ? source.syncInterval : 30,
     lastSyncTime:

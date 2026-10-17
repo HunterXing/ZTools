@@ -1,4 +1,5 @@
-export const GITHUB_REPOSITORY_URL = 'https://github.com/ZToolsCenter/ZTools'
+// 自建版：更新源指向自建 fork，不再引用官方仓库。
+export const GITHUB_REPOSITORY_URL = 'https://github.com/HunterXing/ZTools'
 export const GITHUB_RELEASES_URL = `${GITHUB_REPOSITORY_URL}/releases`
 export const GITHUB_LATEST_RELEASE_URL = `${GITHUB_RELEASES_URL}/latest`
 

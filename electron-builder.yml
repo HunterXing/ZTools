@@ -2,7 +2,7 @@ appId: top.z-tools
 productName: ZTools
 publish:
   provider: github
-  owner: ZToolsCenter
+  owner: HunterXing
   repo: ZTools
 directories:
   buildResources: build
