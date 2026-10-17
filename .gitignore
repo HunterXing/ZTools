@@ -22,3 +22,6 @@ _*
 
 # 本地构建产物
 /dist/
+
+# AppImage 解包目录
+/squashfs-root/
