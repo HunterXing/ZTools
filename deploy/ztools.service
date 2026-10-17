@@ -1,0 +1,21 @@
+[Unit]
+Description=ZTools (self-hosted fork, private sync source)
+Documentation=https://github.com/HunterXing/ZTools
+# 桌面模式：挂 GNOME 物理屏（2026-10-17 由 Xvfb 虚拟屏 :99 改为物理屏 :1）
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=/home/xingheng/.local/bin/ztools-start.sh
+Restart=on-failure
+RestartSec=10
+# Electron 崩溃时留下 core dump 会撑爆磁盘
+LimitCORE=0
+# GNOME 会话的真实 X display（xdpyinfo 实测 1920x1080）
+Environment=DISPLAY=:1
+# XDG_RUNTIME_DIR 缺失会导致 Electron 报 "The name org.freedesktop.Desktop was not provided"
+Environment=XDG_RUNTIME_DIR=/run/user/1000
+Environment=XAUTHORITY=/home/xingheng/.Xauthority
+
+[Install]
+WantedBy=graphical-session.target

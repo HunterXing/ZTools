@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=ZTools
+Name[zh_CN]=ZTools 启动器
+Comment=自建版 ZTools（同步源 wss://ztools.xingheng.work，挂物理屏 :1）
+Exec=/home/xingheng/.local/bin/ztools-start.sh
+Path=/home/xingheng/projects/ztools/squashfs-root
+Icon=application-x-executable
+Terminal=false
+Categories=Utility;
+StartupNotify=true
+X-GNOME-UsesNotifications=true

@@ -62,28 +62,50 @@ pnpm run build:linux:x64     # 产出 dist/*.AppImage + dist/*.deb
 - `dist/ZTools-3.2.0-linux-x86_64.AppImage`（约 116 MB）
 - `dist/ZTools_3.2.0_amd64.deb`（约 79 MB）
 
-## debian 部署（systemd 开机自启）
+## debian 部署（桌面模式 + systemd 开机自启）
 
-无头服务器上没有物理屏，Electron 需要 X display。两个 user unit 分工：
+**当前形态：挂 GNOME 物理屏 `:1`（1920×1080），当桌面应用用。**
+2026-10-17 由「Xvfb 虚拟屏 :99 无头模式」改来——虚拟屏里窗口在 GNOME 上看不见，
+老邢要的是能看见、能当 uTools 启动器用。
 
-- `xvfb-ztools.service` —— 独占 `Xvfb :99 -screen 0 1280x800x24 -nolisten tcp`
-- `ztools.service` —— 跑 `~/.local/bin/ztools-start.sh`，`After/Requires` 上者
-
-`Linger=yes` 已开，用户级服务**无需登录即开机常驻**。
+- `ztools.service` —— `WantedBy=graphical-session.target`，`Environment=DISPLAY=:1`
+- `xvfb-ztools.service` —— **已停用**（unit 文件保留可回退）
+- `~/.local/share/applications/ztools.desktop` —— GNOME 应用菜单条目
+- `Linger=yes`，用户级服务无需登录即开机常驻
 
 ```bash
 export XDG_RUNTIME_DIR="/run/user/$(id -u)"
 systemctl --user daemon-reload
-systemctl --user enable --now xvfb-ztools.service ztools.service
+systemctl --user enable --now ztools.service
 ```
 
-自查脚本：`~/.local/bin/ztools-status.py`（进程 / 同步日志 / 官方出站三项）
+自查脚本：`~/.local/bin/ztools-status.py`（进程 / 显示屏 / 物理屏窗口 / 同步 / 官方出站）
 
-> **踩坑**：`/tmp/.X99-lock` 被手工起的 Xvfb 占着时，systemd 的 Xvfb 会以
-> `Fatal server error: Server is already active for display 99` 退出（`status=1/FAILURE`），
-> 而 ZTools 靠脚本内 `pgrep` 兜底仍能跑——**看起来正常，实际 Xvfb 已脱离 systemd 管理，重启机器就没了**。
-> 切换到 systemd 时须先 `pkill -f 'Xvfb :99'` 并 `rm -f /tmp/.X99-lock /tmp/.X11-unix/X99`。
-> 判据看 `systemctl --user is-active xvfb-ztools.service`，不要看 ZTools 是否在跑。
+**验证窗口真的在物理屏上**（不是只看进程活着）：
+
+```bash
+DISPLAY=:1 xwininfo -root -children | grep ZTools
+# 期望：0x... "ZTools": ("ztools" "ZTools")  800x58+560+256
+```
+
+### 环境事实
+
+| 项                 | 值                       |
+| ------------------ | ------------------------ |
+| GNOME 会话 display | `:1`（1920×1080 物理屏） |
+| 备用 display       | `:2`（1280×800）         |
+| 原虚拟屏           | `:99`（Xvfb，已停）      |
+
+### 历史坑（改物理屏后仍适用）
+
+1. **`/tmp/.X99-lock` 冲突**：手工起的 Xvfb 占着 lock 时，systemd 的 Xvfb 会以
+   `Fatal server error: Server is already active for display 99` 退出（`status=1/FAILURE`），
+   而 ZTools 靠脚本内 `pgrep` 兜底仍能跑——**看起来正常，实际 Xvfb 已脱离 systemd 管理**。
+   切换时须先 `pkill -f 'Xvfb :99'` 并 `rm -f /tmp/.X99-lock /tmp/.X11-unix/X99`。
+2. **systemd 模式日志在 journalctl**：`~/.ztools/logs/*.log` 是脚本 `--daemon` 模式才写的，
+   走 systemd 时 stdout 进 `journalctl --user -u ztools`。查同步日志别只看前者。
+3. **`XDG_RUNTIME_DIR` / `XAUTHORITY` 必须显式给**：user unit 里缺失会让 Electron 报
+   `The name org.freedesktop.Desktop was not provided`。
 
 ## 已踩的坑
 
