@@ -79,10 +79,6 @@ function openGithub(): void {
   window.ztools.shellOpenExternal(GITHUB_REPOSITORY_URL)
 }
 
-function openSponsor(): void {
-  window.ztools.shellOpenExternal('https://afdian.com/a/ZTools')
-}
-
 async function loadAutoCheckSetting(): Promise<void> {
   try {
     const data = await window.ztools.internal.dbGet('settings-general')
@@ -322,22 +318,6 @@ async function handleReceiveBetaUpdatesChange(): Promise<void> {
             </svg>
           </div>
         </div>
-
-        <div class="about-card clickable" @click="openSponsor">
-          <div class="card-icon card-icon-sponsor">
-            <svg width="24" height="24" viewBox="0 0 24 24" fill="none">
-              <path
-                d="M20.84 4.61C20.3292 4.099 19.7228 3.69364 19.0554 3.41708C18.3879 3.14052 17.6725 2.99817 16.95 2.99817C16.2275 2.99817 15.5121 3.14052 14.8446 3.41708C14.1772 3.69364 13.5708 4.099 13.06 4.61L12 5.67L10.94 4.61C9.9083 3.57831 8.50903 2.99871 7.05 2.99871C5.59096 2.99871 4.19169 3.57831 3.16 4.61C2.1283 5.6417 1.54871 7.04097 1.54871 8.5C1.54871 9.95903 2.1283 11.3583 3.16 12.39L4.22 13.45L12 21.23L19.78 13.45L20.84 12.39C21.351 11.8792 21.7563 11.2728 22.0329 10.6054C22.3095 9.93789 22.4518 9.22249 22.4518 8.5C22.4518 7.77751 22.3095 7.0621 22.0329 6.39464C21.7563 5.72718 21.351 5.12075 20.84 4.61Z"
-                stroke="currentColor"
-                stroke-width="2"
-                stroke-linecap="round"
-                stroke-linejoin="round"
-              />
-            </svg>
-          </div>
-          <div class="card-label">赞助支持</div>
-          <div class="card-value">支持作者</div>
-        </div>
       </div>
 
       <!-- 核心技术 -->
@@ -521,11 +501,6 @@ async function handleReceiveBetaUpdatesChange(): Promise<void> {
 .card-icon-github {
   background: #f3f4f6;
   color: #374151;
-}
-
-.card-icon-sponsor {
-  background: #fce7f3;
-  color: #ec4899;
 }
 
 .card-label {
@@ -712,10 +687,6 @@ async function handleReceiveBetaUpdatesChange(): Promise<void> {
   .card-icon-github {
     background: rgba(255, 255, 255, 0.1);
     color: #d1d5db;
-  }
-
-  .card-icon-sponsor {
-    background: rgba(236, 72, 153, 0.15);
   }
 }
 </style>

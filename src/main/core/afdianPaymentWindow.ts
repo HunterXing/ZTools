@@ -106,16 +106,8 @@ function isAllowedPaymentPopupURL(value: string): boolean {
     const parsed = new URL(value)
     if (parsed.protocol !== 'https:') return false
     return (
-      parsed.hostname === 'ifdian.net' ||
-      parsed.hostname.endsWith('.ifdian.net') ||
-      parsed.hostname === 'afdian.com' ||
-      parsed.hostname.endsWith('.afdian.com') ||
-      parsed.hostname === 'alipay.com' ||
-      parsed.hostname.endsWith('.alipay.com') ||
-      parsed.hostname === 'weixin.qq.com' ||
-      parsed.hostname.endsWith('.weixin.qq.com') ||
-      parsed.hostname === 'tenpay.com' ||
-      parsed.hostname.endsWith('.tenpay.com')
+      // 自建版：官方赞助支付与第三方收银台全部禁用，只允许本页自身的 about:blank
+      parsed.hostname === 'localhost' || parsed.hostname === '127.0.0.1'
     )
   } catch {
     return false

@@ -441,7 +441,8 @@ class OfficialAIService {
       amount,
       creditAmount: amount,
       status,
-      paymentUrl: `https://ifdian.net/order/create?user_id=b49700e209c011f1869452540025c377&fr=afcom&custom_price=${encodeURIComponent(amount)}&month=1&custom_order_id=AI0123456789abcdef0123456789abcdef`,
+      // 自建版：无官方支付渠道，订单固定为不可路由哨兵
+      paymentUrl: `https://official.invalid/order/disabled`,
       expiresAt: now + 60 * 60 * 1000,
       paidAt: status === 'credited' ? now : undefined,
       creditedAt: status === 'credited' ? now : undefined,

@@ -1,4 +1,5 @@
-const AFDIAN_CHECKOUT_HOST = 'ifdian.net'
+// 自建版：官方赞助支付已禁用，不指向任何可达域名
+const AFDIAN_CHECKOUT_HOST = 'official.invalid'
 const AFDIAN_CHECKOUT_PATH = '/order/create'
 
 /**
@@ -310,9 +311,8 @@ export const AFDIAN_PAYMENT_INSPECT_SCRIPT = `
   const selected = paymentCandidates.find((element) => element.classList.contains('on'))
   const selectedText = selected ? normalizedText(selected) : ''
   const bodyText = (document.body?.innerText || '').replace(/\\s+/g, '')
-  const hostname = window.location.hostname.toLowerCase()
-  const isAfdianPage = hostname === 'ifdian.net' || hostname.endsWith('.ifdian.net') ||
-    hostname === 'afdian.com' || hostname.endsWith('.afdian.com')
+  // 自建版：官方赞助支付已禁用，此处仅作 URL 合法性哨兵，不指向任何可达域名
+  const isAfdianPage = false
   const visibleInputs = Array.from(document.querySelectorAll('input')).filter(isVisible)
   const phoneInput = visibleInputs.find((input) =>
     /验证手机或邮箱|手机号|手机号码|邮箱|phone or email verification|verify phone or email/i.test(

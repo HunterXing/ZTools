@@ -9,19 +9,21 @@
 
 ## 剥离内容
 
-| 隐私收集点                 | 上游行为                                                                         | 本 fork 处理                                                                                                   |
-| -------------------------- | -------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------- |
-| `activityHeartbeatService` | 每 30 分钟向 `z-tools.top/api/activity/heartbeat` 上报 deviceId / uid / 应用版本 | **服务文件已删除**，`appMain.ts` 启停与 `sync.ts` 全部 7 处调用已摘除                                          |
-| 官方账号                   | 登录 `z-tools.top`，持有 access/refresh token                                    | `normalizeOfficialSession` 恒返回 `null`，所有官方账号态不可达                                                 |
-| 官方 AI 服务               | 模型目录、积分、签到、充值全部打 `z-tools.top`                                   | `OfficialAIService.officialDisabled` 守卫：9 个对外方法入口短路，`requestAuthenticated` 统一抛错，**永不出站** |
-| 官方登录 UI                | 侧边栏头像区「注册/登录 ZTools」+ GitHub 登录对话框                              | 改为「数据同步」入口，直接跳转 Sync 设置页；`/account` 路由移除                                                |
-| 应用更新                   | 查 `github.com/ZToolsCenter/ZTools` release                                      | `electron-builder.yml` 的 `publish.owner` 改为 `HunterXing`                                                    |
+| 隐私收集点                 | 上游行为                                                                               | 本 fork 处理                                                                                                                                         |
+| -------------------------- | -------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `activityHeartbeatService` | 每 30 分钟向 `z-tools.top/api/activity/heartbeat` 上报 deviceId / uid / 应用版本       | **服务文件已删除**，`appMain.ts` 启停与 `sync.ts` 全部 7 处调用已摘除                                                                                |
+| 官方账号                   | 登录 `z-tools.top`，持有 access/refresh token                                          | `normalizeOfficialSession` 恒返回 `null`，所有官方账号态不可达                                                                                       |
+| 官方 AI 服务               | 模型目录、积分、签到、充值全部打 `z-tools.top`                                         | `OfficialAIService.officialDisabled` 守卫：9 个对外方法入口短路，`requestAuthenticated` 统一抛错，**永不出站**                                       |
+| 官方登录 UI                | 侧边栏头像区「注册/登录 ZTools」+ GitHub 登录对话框                                    | 改为「数据同步」入口，直接跳转 Sync 设置页；`/account` 路由移除                                                                                      |
+| 应用更新                   | 查 `github.com/ZToolsCenter/ZTools` release                                            | `electron-builder.yml` 的 `publish.owner` 改为 `HunterXing`                                                                                          |
+| 赞助入口                   | 关于页「赞助支持」卡片跳 `afdian.com/a/ZTools`；AI 积分页「赞助送积分」打 `ifdian.net` | 卡片与 `openSponsor` 已删除；`afdianPaymentWindow` 的弹窗白名单收窄到 localhost；`AFDIAN_CHECKOUT_HOST` 与 E2E 充值 URL 改为 `official.invalid` 哨兵 |
+| 第三方收银台白名单         | `afdian.com` / `alipay.com` / `weixin.qq.com` / `tenpay.com` 均在隐藏窗口白名单内      | 全部移除（`afdianPaymentWindow.ts`）                                                                                                                 |
 
 ### 保留项（有意为之）
 
 - **`syncClient.ts` 的 WebSocket 保活 ping**（每 30s 发 `ping`）——这是自建同步协议的连接保活，发往自建服务器，必须保留。
 - **`LEGACY_OFFICIAL_SYNC_SERVER_URLS` 白名单**（`wss://z.zosen.link` / `wss://z-tools.top`）——仅用于**识别并拒绝**旧版本遗留数据，不作连接目标。
-- **`ifdian.net`（爱发电赞助）**——用户主动点击才打开浏览器，无自动上报。若要彻底移除见下方「待办」。
+- **`OfficialAiCredits.vue` 组件源码**——已被 `v-if="officialProvider.loggedIn"` 挡住，官方账号恒 false 故永不渲染。保留源码而非物理删除，删除属不可逆动作。
 
 ### 官方地址哨兵
 
@@ -60,6 +62,29 @@ pnpm run build:linux:x64     # 产出 dist/*.AppImage + dist/*.deb
 - `dist/ZTools-3.2.0-linux-x86_64.AppImage`（约 116 MB）
 - `dist/ZTools_3.2.0_amd64.deb`（约 79 MB）
 
+## debian 部署（systemd 开机自启）
+
+无头服务器上没有物理屏，Electron 需要 X display。两个 user unit 分工：
+
+- `xvfb-ztools.service` —— 独占 `Xvfb :99 -screen 0 1280x800x24 -nolisten tcp`
+- `ztools.service` —— 跑 `~/.local/bin/ztools-start.sh`，`After/Requires` 上者
+
+`Linger=yes` 已开，用户级服务**无需登录即开机常驻**。
+
+```bash
+export XDG_RUNTIME_DIR="/run/user/$(id -u)"
+systemctl --user daemon-reload
+systemctl --user enable --now xvfb-ztools.service ztools.service
+```
+
+自查脚本：`~/.local/bin/ztools-status.py`（进程 / 同步日志 / 官方出站三项）
+
+> **踩坑**：`/tmp/.X99-lock` 被手工起的 Xvfb 占着时，systemd 的 Xvfb 会以
+> `Fatal server error: Server is already active for display 99` 退出（`status=1/FAILURE`），
+> 而 ZTools 靠脚本内 `pgrep` 兜底仍能跑——**看起来正常，实际 Xvfb 已脱离 systemd 管理，重启机器就没了**。
+> 切换到 systemd 时须先 `pkill -f 'Xvfb :99'` 并 `rm -f /tmp/.X99-lock /tmp/.X11-unix/X99`。
+> 判据看 `systemctl --user is-active xvfb-ztools.service`，不要看 ZTools 是否在跑。
+
 ## 已踩的坑
 
 1. **`ERR_PNPM_IGNORED_BUILDS`**：pnpm 12 的 `allowBuilds` 白名单缺 `electron-winstaller`，install 前置检查直接失败。已补进 `pnpm-workspace.yaml`。
@@ -72,11 +97,20 @@ pnpm run build:linux:x64     # 产出 dist/*.AppImage + dist/*.deb
 ```bash
 pnpm typecheck    # 必须 0 error
 
-# 产物内官方域名清点（应只剩白名单与本文档）
-strings dist/linux-unpacked/resources/app.asar | grep -oE 'z-tools\.top|zosen\.link|official\.invalid|ztools\.xingheng\.work' | sort | uniq -c
+# 产物内官方域名清点：只剩迁移白名单的识别字符串
+python3 - <<'EOF'
+import subprocess
+ASAR = "dist/linux-unpacked/resources/app.asar"
+s = subprocess.run(["strings", "-n", "6", ASAR], capture_output=True, text=True).stdout
+for n in ("z-tools.top", "zosen.link", "afdian.com", "ifdian.net", "赞助支持", "official.invalid"):
+    print(f"  {n:20} {s.count(n)}")
+EOF
 ```
 
-## 待办
+预期：`z-tools.top` / `zosen.link` 少量（迁移白名单），`afdian.com` / `ifdian.net` / `赞助支持` **全为 0**。
 
-- 爱发电赞助入口（`afdianPayment.ts`）尚未移除——属用户主动行为，不构成隐私收集，如需彻底去除再改。
-- debian 无头运行需 `Xvfb` + `--no-sandbox`，部署脚本见后续提交。
+运行期核验（零官方出站）：
+
+```bash
+~/.local/bin/ztools-status.py    # 官方域名命中应为 0
+```

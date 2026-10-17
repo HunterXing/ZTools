@@ -25,6 +25,8 @@ files:
   - '!ztools-plugin-cli/**'
   - '!scripts/**'
   - '!internal-plugins/**'
+  # AppImage 解包运行目录：若不排除会连同内嵌的旧 app.asar 一起被打进产物
+  - '!squashfs-root/**'
   - '!**/*.map'
   - '!**/node_modules/**/*.{d.ts,d.cts,d.mts}'
   - '!**/node_modules/openai/src/**'
